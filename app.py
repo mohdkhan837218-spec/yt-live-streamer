@@ -87,6 +87,8 @@ class StreamState:
     video_url: str = ""
     stream_key: str = ""
     platform: str = "youtube"
+    destinations: list[str] = []
+    active_platforms: list[str] = ["youtube"]
     quality: str = "360p"
     fps: int = 30
     audio_bitrate: str = "128k"
@@ -190,15 +192,23 @@ def build_rtmp_url(platform: str, key: str) -> str:
 
 def build_ffmpeg_command(
     video_url: str,
-    stream_key: str,
-    platform: str = "youtube",
+    destinations: list[str],
     quality: str = "360p",
     fps: int = 30,
     audio_bitrate: str = "128k",
 ) -> list[str]:
     q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["360p"])
-    rtmp = build_rtmp_url(platform, stream_key)
     gop = fps * 2
+
+    if not destinations:
+        destinations = [build_rtmp_url("youtube", "default")]
+
+    if len(destinations) == 1:
+        output_args = ["-f", "flv", destinations[0]]
+    else:
+        # Simultaneous multi-platform streaming via FFmpeg tee muxer
+        tee_str = "|".join([f"[f=flv]{url}" for url in destinations])
+        output_args = ["-f", "tee", tee_str]
 
     return [
         "ffmpeg",
@@ -224,8 +234,7 @@ def build_ffmpeg_command(
         "-flvflags", "no_duration_filesize",
         "-max_delay", "500000",
         "-rtmp_buffer", "1000",
-        "-f", "flv",
-        rtmp,
+        *output_args,
     ]
 
 
@@ -289,36 +298,16 @@ def _monitor_process():
         fps          = stream_state.fps
         audio_bitrate = stream_state.audio_bitrate
 
-    if should_reconnect:
-        logger.warning("FFmpeg process exited. Auto-reconnecting in 5s…")
-        threading.Event().wait(5)
-        success, msg = _launch_ffmpeg(video_url, stream_key, platform, quality, fps, audio_bitrate)
-        if success:
-            logger.info("Auto-reconnect successful.")
-        else:
-            logger.error("Auto-reconnect failed: %s", msg)
-            with _state_lock:
-                stream_state.is_active = False
-                stream_state.process = None
-                stream_state.started_at = None
-    else:
-        logger.warning("FFmpeg process exited. Stream offline.")
-        with _state_lock:
-            stream_state.process = None
-            stream_state.is_active = False
-            stream_state.started_at = None
-
-
 def _launch_ffmpeg(
     video_url: str,
-    stream_key: str,
-    platform: str,
+    destinations: list[str],
+    active_platforms: list[str],
     quality: str,
     fps: int,
     audio_bitrate: str,
 ) -> tuple[bool, str]:
-    cmd = build_ffmpeg_command(video_url, stream_key, platform, quality, fps, audio_bitrate)
-    logger.info("Launching FFmpeg: %s", " ".join(cmd[:8]) + " …")
+    cmd = build_ffmpeg_command(video_url, destinations, quality, fps, audio_bitrate)
+    logger.info("Launching Multi-Stream FFmpeg across %d platforms...", len(destinations))
     try:
         proc = subprocess.Popen(
             cmd,
@@ -333,27 +322,28 @@ def _launch_ffmpeg(
         return False, f"Error launching FFmpeg: {exc}"
 
     with _state_lock:
-        stream_state.process     = proc
-        stream_state.video_url   = video_url
-        stream_state.stream_key  = stream_key
-        stream_state.platform    = platform
-        stream_state.quality     = quality
-        stream_state.fps         = fps
-        stream_state.audio_bitrate = audio_bitrate
-        stream_state.started_at  = datetime.now(timezone.utc)
-        stream_state.is_active   = True
+        stream_state.process          = proc
+        stream_state.video_url        = video_url
+        stream_state.destinations     = destinations
+        stream_state.active_platforms = active_platforms
+        stream_state.quality          = quality
+        stream_state.fps              = fps
+        stream_state.audio_bitrate    = audio_bitrate
+        stream_state.started_at       = datetime.now(timezone.utc)
+        stream_state.is_active        = True
 
     threading.Thread(target=_read_ffmpeg_stderr, args=(proc,), daemon=True).start()
     threading.Thread(target=_monitor_process, daemon=True).start()
 
-    logger.info("FFmpeg started (PID=%s)", proc.pid)
-    return True, f"Stream started (PID={proc.pid})."
+    plat_names = ", ".join([p.upper() for p in active_platforms])
+    logger.info("FFmpeg started (PID=%s) for platforms: %s", proc.pid, plat_names)
+    return True, f"Multi-Stream LIVE on: {plat_names} (PID={proc.pid})."
 
 
 def start_stream(
     video_url: str,
-    stream_key: str,
-    platform: str = "youtube",
+    destinations: list[str],
+    active_platforms: list[str],
     quality: str = "360p",
     fps: int = 30,
     audio_bitrate: str = "128k",
@@ -364,7 +354,7 @@ def start_stream(
             return False, "A stream is already running. Stop it first."
         stream_state.auto_reconnect = auto_reconnect
 
-    return _launch_ffmpeg(video_url, stream_key, platform, quality, fps, audio_bitrate)
+    return _launch_ffmpeg(video_url, destinations, active_platforms, quality, fps, audio_bitrate)
 
 
 def stop_stream() -> tuple[bool, str]:
@@ -447,20 +437,44 @@ def route_start():
 
     data          = request.get_json(silent=True) or request.form
     raw_url       = (data.get("url")          or "").strip()
-    stream_key    = (data.get("key")          or "").strip()
     source_type   = (data.get("source_type")  or "direct").strip()
-    platform      = (data.get("platform")     or "youtube").strip()
     quality       = (data.get("quality")      or "360p").strip()
     fps           = int(data.get("fps", 30))
     audio_bitrate = (data.get("audio_bitrate") or "128k").strip()
     auto_reconnect = str(data.get("auto_reconnect", "true")).lower() == "true"
 
+    yt_key      = (data.get("yt_key")      or "").strip()
+    fb_key      = (data.get("fb_key")      or "").strip()
+    tw_key      = (data.get("tw_key")      or "").strip()
+    custom_rtmp = (data.get("custom_rtmp") or "").strip()
+    single_key  = (data.get("key")          or "").strip()
+    single_plat = (data.get("platform")     or "youtube").strip()
+
+    destinations = []
+    active_platforms = []
+
+    if yt_key:
+        destinations.append(build_rtmp_url("youtube", yt_key))
+        active_platforms.append("youtube")
+    if fb_key:
+        destinations.append(build_rtmp_url("facebook", fb_key))
+        active_platforms.append("facebook")
+    if tw_key:
+        destinations.append(build_rtmp_url("twitch", tw_key))
+        active_platforms.append("twitch")
+    if custom_rtmp:
+        destinations.append(custom_rtmp)
+        active_platforms.append("custom")
+
+    if not destinations and single_key:
+        destinations.append(build_rtmp_url(single_plat, single_key))
+        active_platforms.append(single_plat)
+
     if not raw_url:
         return jsonify({"success": False, "message": "Video URL/path is required."}), 400
-    if not stream_key:
-        return jsonify({"success": False, "message": "Stream key is required."}), 400
-    if platform not in PLATFORM_RTMP:
-        return jsonify({"success": False, "message": f"Unknown platform: {platform}"}), 400
+    if not destinations:
+        return jsonify({"success": False, "message": "At least one stream key is required."}), 400
+
     if quality not in QUALITY_PRESETS:
         quality = "360p"
 
@@ -472,7 +486,7 @@ def route_start():
         video_url = raw_url
 
     success, message = start_stream(
-        video_url, stream_key, platform, quality, fps, audio_bitrate, auto_reconnect
+        video_url, destinations, active_platforms, quality, fps, audio_bitrate, auto_reconnect
     )
     return jsonify({"success": success, "message": message}), 200 if success else 409
 
@@ -942,12 +956,24 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
       </div>
 
-      <!-- STREAM CONFIG -->
+      <!-- STREAM CONFIG & MULTI-PLATFORM SETUP -->
       <div class="glass rounded-2xl p-5">
-        <div class="sec-label">🎛️ Streaming Setup</div>
+        <div class="sec-label">🎛️ Multi-Platform Streaming Setup</div>
 
-        <!-- Platform -->
-        <div class="mb-4">
+        <!-- Mode Toggle -->
+        <div class="flex items-center justify-between glass rounded-xl p-3 mb-4">
+          <div>
+            <p class="text-slate-200 text-xs font-bold">✨ Multi-Platform Restream Mode</p>
+            <p class="text-slate-500 text-xs">Stream simultaneously to YouTube, Facebook, Twitch & Custom RTMP</p>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="multi-stream-toggle" onchange="toggleMultiStream(this)"/>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+
+        <!-- Single Platform Selector -->
+        <div id="single-platform-wrap" class="mb-4">
           <label class="block text-slate-400 text-xs font-semibold mb-2">Target Platform</label>
           <div class="flex flex-wrap gap-2">
             <button class="plat-btn active" onclick="setPlatform('youtube')"  id="plat-youtube">  📺 YouTube</button>
@@ -955,15 +981,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <button class="plat-btn"        onclick="setPlatform('twitch')"   id="plat-twitch">   🟣 Twitch</button>
             <button class="plat-btn"        onclick="setPlatform('custom')"   id="plat-custom">   🔧 Custom RTMP</button>
           </div>
+          <div class="mt-3">
+            <label class="block text-slate-400 text-xs font-semibold mb-1">🔑 Stream Key</label>
+            <input id="stream-key" class="inp font-mono" type="password" placeholder="xxxx-xxxx-xxxx-xxxx"/>
+          </div>
         </div>
 
-        <!-- Key / Custom -->
-        <div class="mb-4">
-          <label class="block text-slate-400 text-xs font-semibold mb-2" id="key-label">🔑 Stream Key</label>
-          <input id="stream-key" class="inp font-mono" type="password" placeholder="xxxx-xxxx-xxxx-xxxx-xxxx"/>
-          <div id="custom-rtmp-wrap" class="mt-2 hidden">
-            <label class="block text-slate-400 text-xs font-semibold mb-1">Custom RTMP URL</label>
-            <input id="custom-rtmp" class="inp font-mono" type="text" placeholder="rtmp://server.com/live/YOUR_KEY"/>
+        <!-- Multi-Platform Stream Keys -->
+        <div id="multi-platform-wrap" class="space-y-3 mb-4 hidden">
+          <div>
+            <label class="block text-slate-300 text-xs font-bold mb-1">📺 YouTube Live Stream Key</label>
+            <input id="yt-key" class="inp font-mono text-xs" type="password" placeholder="xxxx-xxxx-xxxx-xxxx"/>
+          </div>
+          <div>
+            <label class="block text-slate-300 text-xs font-bold mb-1">📘 Facebook Live Stream Key</label>
+            <input id="fb-key" class="inp font-mono text-xs" type="password" placeholder="FB-12345-xxxx-xxxx"/>
+          </div>
+          <div>
+            <label class="block text-slate-300 text-xs font-bold mb-1">🟣 Twitch Stream Key</label>
+            <input id="tw-key" class="inp font-mono text-xs" type="password" placeholder="live_xxxx_xxxx"/>
+          </div>
+          <div>
+            <label class="block text-slate-300 text-xs font-bold mb-1">🔧 Custom RTMP Server URL</label>
+            <input id="custom-rtmp" class="inp font-mono text-xs" type="text" placeholder="rtmp://server.com/live/YOUR_KEY"/>
           </div>
         </div>
 
@@ -1300,23 +1340,40 @@ function getVideoURL() {
   return '';
 }
 
+function toggleMultiStream(cb) {
+  document.getElementById('multi-platform-wrap').classList.toggle('hidden', !cb.checked);
+  document.getElementById('single-platform-wrap').classList.toggle('hidden', cb.checked);
+}
+
 async function startStream() {
   const url = getVideoURL();
-  let key   = document.getElementById('stream-key').value.trim();
-  if (activePlatform === 'custom') key = document.getElementById('custom-rtmp').value.trim();
+  const isMulti = document.getElementById('multi-stream-toggle').checked;
 
   if (!url) return showToast('Please select or enter a video source.', 'error');
-  if (!key) return showToast('Please enter your stream key.', 'error');
+
+  let payload = {
+    url, source_type: activeTab,
+    quality: activeQuality, fps: 30, audio_bitrate: '128k',
+    auto_reconnect: document.getElementById('auto-reconnect').checked,
+  };
+
+  if (isMulti) {
+    payload.yt_key = document.getElementById('yt-key').value.trim();
+    payload.fb_key = document.getElementById('fb-key').value.trim();
+    payload.tw_key = document.getElementById('tw-key').value.trim();
+    payload.custom_rtmp = document.getElementById('custom-rtmp').value.trim();
+  } else {
+    let key = document.getElementById('stream-key').value.trim();
+    if (activePlatform === 'custom') key = document.getElementById('custom-rtmp').value.trim();
+    payload.key = key;
+    payload.platform = activePlatform;
+  }
 
   try {
     const res  = await fetch('/start', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({
-        url, key, source_type: activeTab, platform: activePlatform,
-        quality: activeQuality, fps: 30, audio_bitrate: '128k',
-        auto_reconnect: document.getElementById('auto-reconnect').checked,
-      }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json();
     showToast(data.message, data.success ? 'success' : 'error');
