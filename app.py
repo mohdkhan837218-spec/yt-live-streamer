@@ -188,8 +188,9 @@ def resolve_youtube_url(url: str) -> tuple[str, str]:
         result = subprocess.run(
             [
                 "yt-dlp",
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best/b",
                 "--no-warnings",
+                "--no-call-home",
                 "--get-url",
                 url,
             ],
@@ -197,15 +198,26 @@ def resolve_youtube_url(url: str) -> tuple[str, str]:
             text=True,
             timeout=35,
         )
-        if result.returncode == 0:
-            urls = result.stdout.strip().splitlines()
-            if urls:
-                return urls[0], ""
-        return "", f"yt-dlp error: {result.stderr.strip()[:300]}"
+        # Extract direct stream URLs from stdout
+        stdout_lines = result.stdout.strip().splitlines()
+        urls = [line.strip() for line in stdout_lines if line.strip().startswith("http") or "googlevideo.com" in line or "manifest" in line]
+        if urls:
+            return urls[0], ""
+
+        # If stdout has any line, return it
+        if result.stdout.strip():
+            for line in stdout_lines:
+                if "http" in line:
+                    return line.strip(), ""
+
+        # Filter out WARNING lines from stderr
+        err_lines = [line for line in result.stderr.strip().splitlines() if not line.startswith("WARNING:")]
+        clean_err = "\n".join(err_lines[:5]).strip() or result.stderr.strip()[:300] or "Could not extract video stream."
+        return "", f"YouTube URL Error: {clean_err}"
     except FileNotFoundError:
         return "", "yt-dlp is not installed."
     except subprocess.TimeoutExpired:
-        return "", "yt-dlp timed out fetching media stream."
+        return "", "yt-dlp timed out fetching YouTube media stream."
     except Exception as exc:
         return "", str(exc)
 
