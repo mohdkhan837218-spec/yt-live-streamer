@@ -52,6 +52,10 @@ PLATFORM_RTMP = {
 
 # ─── Quality Presets ───────────────────────────────────────────────────────────
 QUALITY_PRESETS = {
+    "480p": {
+        "vb": "1500k", "maxrate": "1500k",
+        "bufsize": "3000k", "scale": "854:480",
+    },
     "720p": {
         "vb": "2500k", "maxrate": "2500k",
         "bufsize": "5000k", "scale": "1280:720",
@@ -739,8 +743,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="mb-5">
           <label class="block text-slate-400 text-xs font-semibold mb-3">Video Quality</label>
           <div class="flex flex-wrap gap-2">
+            <div class="q-card active" onclick="setQuality('480p')"     id="q-480p">     <div class="label">480p ⭐</div>  <div class="sub">1.5 Mbps · Stable</div></div>
             <div class="q-card" onclick="setQuality('720p')"     id="q-720p">     <div class="label">720p</div>    <div class="sub">2.5 Mbps</div></div>
-            <div class="q-card active" onclick="setQuality('1080p')"   id="q-1080p">   <div class="label">1080p</div>   <div class="sub">4 Mbps</div></div>
+            <div class="q-card" onclick="setQuality('1080p')"   id="q-1080p">   <div class="label">1080p</div>   <div class="sub">4 Mbps</div></div>
             <div class="q-card" onclick="setQuality('1080p_hq')" id="q-1080p_hq"> <div class="label">1080p HQ</div><div class="sub">6 Mbps</div></div>
             <div class="q-card" onclick="setQuality('4k')"       id="q-4k">       <div class="label">4K Ultra</div><div class="sub">8 Mbps</div></div>
           </div>
@@ -840,7 +845,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 // ─── State ────────────────────────────────────────────────────────────────────
 let activeTab      = 'direct';
 let activePlatform = 'youtube';
-let activeQuality  = '1080p';
+let activeQuality  = '480p';
 let activeFPS      = 30;
 let resolvedURLs   = {};  // tab -> resolved URL
 
@@ -872,7 +877,7 @@ function setPlatform(p) {
 
 // ─── Quality Selection ─────────────────────────────────────────────────────────
 function setQuality(q) {
-  ['720p','1080p','1080p_hq','4k'].forEach(x => {
+  ['480p','720p','1080p','1080p_hq','4k'].forEach(x => {
     document.getElementById('q-' + x).classList.toggle('active', x === q);
   });
   activeQuality = q;
