@@ -239,7 +239,82 @@ def resolve_video_url(raw_url: str, source_type: str) -> tuple[str, str]:
         except Exception:
             pass
 
-    return raw_url, ""
+def auto_extract_video_metadata(target_url_or_path: str, source_type: str, file_name: str = "") -> dict:
+    """Extracts Title, Description, Tags, and Thumbnail frame automatically from any video source."""
+    extracted_title = ""
+    extracted_desc = ""
+    extracted_tags = []
+    extracted_thumb_path = ""
+
+    # 1. Try yt-dlp metadata extraction for YouTube / Cloud links
+    try:
+        cmd = ["yt-dlp", "-J", "--no-warnings", target_url_or_path]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and res.stdout.strip():
+            info = json.loads(res.stdout)
+            extracted_title = info.get("title", "")
+            extracted_desc  = info.get("description", "")
+            extracted_tags  = info.get("tags", [])
+            thumb_url       = info.get("thumbnail", "")
+
+            if thumb_url:
+                t_res = requests.get(thumb_url, timeout=10)
+                if t_res.status_code == 200:
+                    thumb_file = THUMB_DIR / f"auto_thumb_{uuid.uuid4().hex[:8]}.jpg"
+                    with open(thumb_file, "wb") as f:
+                        f.write(t_res.content)
+                    extracted_thumb_path = str(thumb_file)
+    except Exception as exc:
+        logger.debug("yt-dlp auto metadata extraction failed: %s", exc)
+
+    # 2. Clean Title & SEO generation fallback
+    if not extracted_title:
+        base_name = file_name or Path(target_url_or_path.split("?")[0].split("/")[-1]).stem
+        clean_name = base_name.replace("_", " ").replace("-", " ")
+        clean_name = re.sub(r"[^\w\s]", "", clean_name).strip()
+        if not clean_name:
+            clean_name = "24/7 Live Stream Video"
+        extracted_title = f"🔴 {clean_name.title()} | 24/7 Non-Stop Live Stream (60FPS)"
+
+    if not extracted_desc:
+        extracted_desc = (
+            f"Welcome to our official 24/7 live stream featuring {extracted_title}!\n\n"
+            "🔔 Subscribe and turn on notifications to stay updated.\n\n"
+            "#LiveStream #247Stream #YouTubeLive #60FPS #NonStop"
+        )
+
+    if not extracted_tags:
+        words = [w.lower() for w in re.findall(r"\b\w{4,}\b", extracted_title) if w.lower() not in {"live","stream","non","stop","video"}]
+        base_tags = ["live", "24/7", "live stream", "youtube live", "60fps", "non stop"]
+        extracted_tags = list(dict.fromkeys(base_tags + words[:8]))
+
+    tags_str = ", ".join(extracted_tags) if isinstance(extracted_tags, list) else str(extracted_tags)
+
+    # 3. Automatic Thumbnail Frame Extraction via FFmpeg
+    if not extracted_thumb_path:
+        try:
+            thumb_file = THUMB_DIR / f"auto_frame_{uuid.uuid4().hex[:8]}.jpg"
+            ff_cmd = [
+                "ffmpeg", "-y",
+                "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "-ss", "00:00:05",
+                "-i", target_url_or_path,
+                "-vframes", "1",
+                "-q:v", "2",
+                str(thumb_file)
+            ]
+            ff_res = subprocess.run(ff_cmd, capture_output=True, timeout=12)
+            if ff_res.returncode == 0 and thumb_file.exists():
+                extracted_thumb_path = str(thumb_file)
+        except Exception as exc:
+            logger.debug("FFmpeg frame extraction failed: %s", exc)
+
+    return {
+        "title":          extracted_title,
+        "description":    extracted_desc,
+        "tags":           tags_str,
+        "thumbnail_path": extracted_thumb_path,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -645,6 +720,9 @@ def route_upload():
 
     size_mb = round(size / (1024**2), 1)
 
+    # Auto-extract SEO Title, Description, Tags, and Thumbnail Frame from uploaded file
+    seo_meta = auto_extract_video_metadata(str(save_path), "upload", f.filename)
+
     with _state_lock:
         stream_state.uploaded_file = save_path
         stream_state.attached_source_name = f.filename
@@ -652,13 +730,27 @@ def route_upload():
         stream_state.attached_size_mb = size_mb
         stream_state.attached_status = "verified"
 
+        stream_state.title = seo_meta["title"]
+        stream_state.description = seo_meta["description"]
+        stream_state.tags = seo_meta["tags"]
+        if seo_meta["thumbnail_path"]:
+            stream_state.thumbnail_path = seo_meta["thumbnail_path"]
+
+    thumb_url = f"/thumbnail/{Path(seo_meta['thumbnail_path']).name}" if seo_meta["thumbnail_path"] else None
+
     return jsonify({
-        "success":   True,
-        "message":   f"File uploaded: {f.filename}",
-        "file_path": str(save_path),
-        "file_name": f.filename,
-        "size_mb":   size_mb,
-        "preview_url": f"/uploaded-video/{unique_name}",
+        "success":       True,
+        "message":       f"File uploaded & SEO auto-generated: {f.filename}",
+        "file_path":     str(save_path),
+        "file_name":     f.filename,
+        "size_mb":       size_mb,
+        "preview_url":   f"/uploaded-video/{unique_name}",
+        "seo": {
+            "title":          seo_meta["title"],
+            "description":    seo_meta["description"],
+            "tags":           seo_meta["tags"],
+            "thumbnail_url":  thumb_url,
+        }
     })
 
 
@@ -754,13 +846,34 @@ def route_resolve_url():
     }
     st_label = labels.get(source_type, "Cloud Video URL")
 
+    # Auto-extract SEO Title, Description, Tags, and Thumbnail Frame
+    seo_meta = auto_extract_video_metadata(resolved, source_type, raw_url[:30])
+
     with _state_lock:
         stream_state.attached_source_name = raw_url[:40] + "..." if len(raw_url) > 40 else raw_url
         stream_state.attached_source_type = st_label
         stream_state.attached_size_mb = 0.0
         stream_state.attached_status = "verified"
 
-    return jsonify({"success": True, "resolved_url": resolved, "source_label": st_label})
+        stream_state.title = seo_meta["title"]
+        stream_state.description = seo_meta["description"]
+        stream_state.tags = seo_meta["tags"]
+        if seo_meta["thumbnail_path"]:
+            stream_state.thumbnail_path = seo_meta["thumbnail_path"]
+
+    thumb_url = f"/thumbnail/{Path(seo_meta['thumbnail_path']).name}" if seo_meta["thumbnail_path"] else None
+
+    return jsonify({
+        "success": True,
+        "resolved_url": resolved,
+        "source_label": st_label,
+        "seo": {
+            "title":          seo_meta["title"],
+            "description":    seo_meta["description"],
+            "tags":           seo_meta["tags"],
+            "thumbnail_url":  thumb_url,
+        }
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
