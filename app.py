@@ -579,7 +579,14 @@ def route_upload():
         "file_path": str(save_path),
         "file_name": f.filename,
         "size_mb":   size_mb,
+        "preview_url": f"/uploaded-video/{unique_name}",
     })
+
+
+@app.route("/uploaded-video/<filename>")
+def route_get_uploaded_video(filename):
+    from flask import send_from_directory
+    return send_from_directory(UPLOAD_DIR, filename)
 
 
 @app.route("/upload-thumbnail", methods=["POST"])
@@ -820,6 +827,22 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <!-- LEFT COLUMN: CONTROLS & SOURCES -->
     <div class="lg:col-span-2 space-y-6">
 
+      <!-- LIVE VIDEO PREVIEW & PLAYER WINDOW -->
+      <div id="video-preview-card" class="glass rounded-2xl p-5">
+        <div class="sec-label flex justify-between items-center">
+          <span>📺 Live Video Preview & Player</span>
+          <span id="preview-badge" class="px-2.5 py-1 rounded-full text-[10px] font-bold bg-slate-800 text-slate-400">NO VIDEO LOADED</span>
+        </div>
+        <div class="relative w-full aspect-video rounded-xl bg-black border border-slate-800 flex items-center justify-center overflow-hidden">
+          <video id="video-preview-player" class="w-full h-full object-contain hidden" controls autoplay loop muted playsinline></video>
+          <div id="video-preview-placeholder" class="text-center p-6">
+            <span class="text-4xl block mb-2">🎬</span>
+            <p class="text-slate-400 text-xs font-bold">Video Preview Window</p>
+            <p class="text-slate-600 text-[11px] mt-1">Upload a video or attach a cloud link to preview live</p>
+          </div>
+        </div>
+      </div>
+
       <!-- VIDEO SOURCE SELECTION -->
       <div class="glass rounded-2xl p-5">
         <div class="sec-label">📹 Video Source & Live Upload Progress</div>
@@ -850,12 +873,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div id="upload-progress-box" class="mt-4 glass rounded-xl p-4 hidden">
             <div class="flex justify-between items-center text-xs font-bold mb-2">
               <span id="upload-file-name" class="text-sky-400 truncate max-w-[200px]">uploading.mp4</span>
-              <span id="upload-pct" class="text-emerald-400 text-sm font-black">0%</span>
+              <span id="upload-pct" class="text-amber-400 text-sm font-black">0%</span>
             </div>
-            <div class="pbar mb-2"><div id="upload-bar" class="pbar-fill bg-gradient-to-r from-sky-400 to-emerald-400" style="width:0%"></div></div>
+            <div class="pbar mb-2"><div id="upload-bar" class="pbar-fill bg-amber-400" style="width:0%"></div></div>
             <div class="flex justify-between text-xs text-slate-500 font-mono">
               <span id="upload-mb">0 MB / 0 MB</span>
               <span id="upload-speed">0 MB/s</span>
+            </div>
+            <div id="upload-complete-banner" class="mt-3 p-2.5 bg-emerald-500/20 border border-emerald-500/40 rounded-lg text-emerald-400 text-xs font-bold text-center hidden">
+              🎉 UPLOAD COMPLETE & VERIFIED! Video is 100% uploaded and ready to stream.
             </div>
           </div>
 
@@ -1091,22 +1117,31 @@ async function resolveURL(sourceType) {
   }
 }
 
-// Real-Time PC File Upload with Live Progress Bar (XHR)
+// Real-Time PC File Upload with Live Progress Bar & Completion Guard
 function handleFileSelect(input) {
   if (!input.files[0]) return;
   const file = input.files[0];
 
-  const box    = document.getElementById('upload-progress-box');
-  const nameEl = document.getElementById('upload-file-name');
-  const pctEl  = document.getElementById('upload-pct');
-  const barEl  = document.getElementById('upload-bar');
-  const mbEl   = document.getElementById('upload-mb');
-  const spdEl  = document.getElementById('upload-speed');
+  const box        = document.getElementById('upload-progress-box');
+  const nameEl     = document.getElementById('upload-file-name');
+  const pctEl      = document.getElementById('upload-pct');
+  const barEl      = document.getElementById('upload-bar');
+  const mbEl       = document.getElementById('upload-mb');
+  const spdEl      = document.getElementById('upload-speed');
+  const banner     = document.getElementById('upload-complete-banner');
+  const startBtn   = document.getElementById('btn-start');
 
   box.classList.remove('hidden');
+  banner.classList.add('hidden');
   nameEl.textContent = file.name;
   pctEl.textContent  = '0%';
+  pctEl.className    = 'text-amber-400 text-sm font-black';
+  barEl.className    = 'pbar-fill bg-amber-400';
   barEl.style.width  = '0%';
+
+  // Lock Start Button during upload
+  startBtn.disabled  = true;
+  startBtn.textContent = '⏳ Uploading Video... Please Wait';
 
   const formData = new FormData();
   formData.append('file', file);
@@ -1122,7 +1157,7 @@ function handleFileSelect(input) {
       const elapsedSec = (Date.now() - startTime) / 1000;
       const speedMBs   = elapsedSec > 0 ? ((e.loaded / (1024*1024)) / elapsedSec).toFixed(1) : '0';
 
-      pctEl.textContent  = pct + '%';
+      pctEl.textContent  = pct + '% UPLOADING';
       barEl.style.width  = pct + '%';
       mbEl.textContent   = `${loadedMB} MB / ${totalMB} MB`;
       spdEl.textContent  = `${speedMBs} MB/s`;
@@ -1135,18 +1170,51 @@ function handleFileSelect(input) {
       if (data.success) {
         resolvedURLs['upload'] = data.file_path;
         document.getElementById('url-upload').value = data.file_path;
-        pctEl.textContent = '100% DONE ✅';
-        showToast(`Uploaded ${data.file_name} successfully!`, 'success');
+
+        // Completion status UI updates
+        pctEl.textContent  = '100% COMPLETE 🎉';
+        pctEl.className    = 'text-emerald-400 text-sm font-black';
+        barEl.className    = 'pbar-fill bg-emerald-400';
+        barEl.style.width  = '100%';
+        banner.classList.remove('hidden');
+
+        // Unlock Start Stream Button
+        startBtn.disabled  = false;
+        startBtn.textContent = '▶️ Start 24/7 Stream';
+
+        // Load Live Video Preview Player
+        if (data.preview_url) {
+          const player = document.getElementById('video-preview-player');
+          const placeholder = document.getElementById('video-preview-placeholder');
+          const badge = document.getElementById('preview-badge');
+
+          player.src = data.preview_url;
+          player.classList.remove('hidden');
+          placeholder.classList.add('hidden');
+          badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+          badge.textContent = '🟢 PREVIEW READY (' + data.file_name + ')';
+        }
+
+        showToast(`🎉 ${data.file_name} uploaded & ready to stream!`, 'success');
         pollStatus();
       } else {
+        startBtn.disabled = false;
+        startBtn.textContent = '▶️ Start 24/7 Stream';
         showToast(data.message, 'error');
       }
     } else {
+      startBtn.disabled = false;
+      startBtn.textContent = '▶️ Start 24/7 Stream';
       showToast('Upload failed.', 'error');
     }
   };
 
-  xhr.onerror = function() { showToast('Upload network error.', 'error'); };
+  xhr.onerror = function() {
+    startBtn.disabled = false;
+    startBtn.textContent = '▶️ Start 24/7 Stream';
+    showToast('Upload network error.', 'error');
+  };
+
   xhr.open('POST', '/upload', true);
   xhr.send(formData);
 }
