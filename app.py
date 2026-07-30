@@ -1504,6 +1504,19 @@ def run_telegram_bot(token: str):
     application.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 
+def _keep_alive_thread():
+    """Background thread: pings local status endpoint every 2 minutes to keep server awake 24/7."""
+    import time
+    time.sleep(15)
+    while True:
+        try:
+            port = os.environ.get("PORT", "5000")
+            requests.get(f"http://127.0.0.1:{port}/api/status", timeout=5)
+        except Exception:
+            pass
+        time.sleep(120)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1513,5 +1526,9 @@ if __name__ == "__main__":
     if bot_token:
         threading.Thread(target=run_telegram_bot, args=(bot_token,), daemon=True, name="TelegramBot").start()
 
-    logger.info("Starting Flask on 0.0.0.0:7860…")
-    app.run(host="0.0.0.0", port=7860, debug=False, use_reloader=False, threaded=True)
+    # Start 24/7 Keep-Alive Thread
+    threading.Thread(target=_keep_alive_thread, daemon=True, name="KeepAlive").start()
+
+    port = int(os.environ.get("PORT", 5000))
+    logger.info("Starting Flask on 0.0.0.0:%d…", port)
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
