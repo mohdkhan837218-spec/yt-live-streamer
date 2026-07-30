@@ -1,10 +1,11 @@
 """
-YouTube 24/7 Live Streamer — app.py (Advanced Edition)
-=======================================================
-Flask + Telegram Bot + FFmpeg with:
+YouTube 24/7 Live Streamer — app.py (Ultimate Pro Edition)
+===========================================================
+Flask + Telegram Bot + FFmpeg + YouTube Live SEO & Metadata Engine:
   - Multiple video sources (URL / PC Upload / Google Drive / Dropbox / YouTube via yt-dlp)
-  - Advanced stream settings (platform, quality, fps, audio, auto-reconnect)
-  - Professional dashboard UI
+  - Advanced stream settings (platform, quality presets, fps, audio, auto-reconnect)
+  - Real-time FFmpeg Health & Speed Stats Monitor (FPS, Bitrate, Speed, Health Badge)
+  - YouTube Live SEO & Metadata Suite (Title, Description, Tags Generator, Thumbnail Upload & API updater)
 """
 
 import os
@@ -15,12 +16,13 @@ import threading
 import uuid
 import asyncio
 import logging
-import shutil
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import psutil
+import requests
 from flask import Flask, jsonify, render_template_string, request
 
 from telegram import Update
@@ -37,9 +39,11 @@ logger = logging.getLogger("yt-streamer")
 # ─── Flask App ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-# ─── Upload Directory ──────────────────────────────────────────────────────────
+# ─── Upload Directories ────────────────────────────────────────────────────────
 UPLOAD_DIR = Path("/tmp/yt_streamer_uploads")
+THUMB_DIR  = Path("/tmp/yt_streamer_thumbnails")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+THUMB_DIR.mkdir(parents=True, exist_ok=True)
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 
 # ─── Platform RTMP Endpoints ───────────────────────────────────────────────────
@@ -76,7 +80,7 @@ QUALITY_PRESETS = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Stream State
+# Stream State & Stats
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _state_lock = threading.Lock()
@@ -87,16 +91,34 @@ class StreamState:
     video_url: str = ""
     stream_key: str = ""
     platform: str = "youtube"
-    quality: str = "1080p"
+    quality: str = "480p"
     fps: int = 30
     audio_bitrate: str = "128k"
     auto_reconnect: bool = False
     started_at: Optional[datetime] = None
     is_active: bool = False
-    uploaded_file: Optional[Path] = None   # track uploaded file for cleanup
+    uploaded_file: Optional[Path] = None
+
+    # SEO & Metadata
+    title: str = "24/7 Non-Stop Live Stream 🔴"
+    description: str = "Welcome to our 24/7 non-stop continuous live stream! Enjoy watching 24/7."
+    tags: str = "live, 24/7, streaming, youtube live, stream"
+    category_id: str = "24"  # Entertainment
+    thumbnail_path: Optional[str] = None
 
 
 stream_state = StreamState()
+
+# Live stats from FFmpeg stderr (updated continuously)
+ffmpeg_live_stats: dict = {
+    "frame": 0,
+    "fps": 0.0,
+    "bitrate": "0kbits/s",
+    "speed": "0x",
+    "size_kb": 0,
+    "time": "00:00:00",
+    "health": "offline",  # offline | good | warning | poor
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -104,10 +126,6 @@ stream_state = StreamState()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def resolve_gdrive_url(url: str) -> tuple[str, str]:
-    """Convert Google Drive share URL to direct download URL."""
-    # Patterns:
-    # https://drive.google.com/file/d/FILE_ID/view
-    # https://drive.google.com/open?id=FILE_ID
     match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
     if not match:
         match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
@@ -119,7 +137,6 @@ def resolve_gdrive_url(url: str) -> tuple[str, str]:
 
 
 def resolve_dropbox_url(url: str) -> tuple[str, str]:
-    """Convert Dropbox share URL to direct download URL."""
     direct = re.sub(r"[?&]dl=0", "", url)
     if "?" in direct:
         direct += "&dl=1"
@@ -129,7 +146,6 @@ def resolve_dropbox_url(url: str) -> tuple[str, str]:
 
 
 def resolve_youtube_url(url: str) -> tuple[str, str]:
-    """Use yt-dlp to extract a direct stream URL from YouTube."""
     try:
         result = subprocess.run(
             [
@@ -144,7 +160,6 @@ def resolve_youtube_url(url: str) -> tuple[str, str]:
         )
         if result.returncode == 0:
             urls = result.stdout.strip().splitlines()
-            # Return the first URL (video); yt-dlp may return 2 lines for separate A/V
             return urls[0], ""
         return "", f"yt-dlp error: {result.stderr.strip()[:300]}"
     except FileNotFoundError:
@@ -156,19 +171,17 @@ def resolve_youtube_url(url: str) -> tuple[str, str]:
 
 
 def resolve_video_url(raw_url: str, source_type: str) -> tuple[str, str]:
-    """Resolve any video source type to a final FFmpeg-compatible URL."""
     if source_type == "gdrive":
         return resolve_gdrive_url(raw_url)
     if source_type == "dropbox":
         return resolve_dropbox_url(raw_url)
     if source_type == "youtube":
         return resolve_youtube_url(raw_url)
-    # direct / uploaded file path
     return raw_url, ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FFmpeg Command Builder
+# FFmpeg Command & Monitoring
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_rtmp_url(platform: str, key: str) -> str:
@@ -180,13 +193,13 @@ def build_ffmpeg_command(
     video_url: str,
     stream_key: str,
     platform: str = "youtube",
-    quality: str = "1080p",
+    quality: str = "480p",
     fps: int = 30,
     audio_bitrate: str = "128k",
 ) -> list[str]:
-    q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["1080p"])
+    q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["480p"])
     rtmp = build_rtmp_url(platform, stream_key)
-    gop = fps * 2  # keyframe interval = 2 seconds
+    gop = fps * 2
 
     return [
         "ffmpeg",
@@ -213,12 +226,48 @@ def build_ffmpeg_command(
     ]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Process Management
-# ═══════════════════════════════════════════════════════════════════════════════
+def _read_ffmpeg_stderr(proc: subprocess.Popen) -> None:
+    """Background thread: parses FFmpeg stderr for real-time FPS, bitrate, and speed stats."""
+    global ffmpeg_live_stats
+    stat_pattern = re.compile(
+        r"frame=\s*(?P<frame>\d+).*?fps=\s*(?P<fps>[\d.]+).*?"
+        r"size=\s*(?P<size>[\d]+)kB.*?time=(?P<time>[\d:.]+).*?"
+        r"bitrate=\s*(?P<bitrate>[\d.]+kbits/s).*?speed=\s*(?P<speed>[\d.]+x)"
+    )
+    try:
+        for raw_line in proc.stderr:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            m = stat_pattern.search(line)
+            if m:
+                speed_str = m.group("speed").rstrip("x")
+                try:
+                    speed_val = float(speed_str)
+                except ValueError:
+                    speed_val = 1.0
+
+                if speed_val >= 0.92:
+                    health = "good"
+                elif speed_val >= 0.70:
+                    health = "warning"
+                else:
+                    health = "poor"
+
+                ffmpeg_live_stats = {
+                    "frame":   int(m.group("frame")),
+                    "fps":     float(m.group("fps")),
+                    "bitrate": m.group("bitrate"),
+                    "speed":   m.group("speed"),
+                    "size_kb": int(m.group("size")),
+                    "time":    m.group("time"),
+                    "health":  health,
+                }
+    except Exception as exc:
+        logger.debug("Stderr reader error: %s", exc)
+    finally:
+        ffmpeg_live_stats["health"] = "offline"
+
 
 def _monitor_process():
-    """Watches the FFmpeg process. Auto-reconnects if enabled."""
     with _state_lock:
         proc = stream_state.process
 
@@ -229,7 +278,7 @@ def _monitor_process():
 
     with _state_lock:
         if stream_state.process is not proc:
-            return  # A different process is now active; ignore
+            return
         should_reconnect = stream_state.auto_reconnect and stream_state.is_active
         video_url    = stream_state.video_url
         stream_key   = stream_state.stream_key
@@ -239,7 +288,7 @@ def _monitor_process():
         audio_bitrate = stream_state.audio_bitrate
 
     if should_reconnect:
-        logger.warning("FFmpeg exited unexpectedly. Auto-reconnecting in 5s…")
+        logger.warning("FFmpeg process exited. Auto-reconnecting in 5s…")
         threading.Event().wait(5)
         success, msg = _launch_ffmpeg(video_url, stream_key, platform, quality, fps, audio_bitrate)
         if success:
@@ -251,7 +300,7 @@ def _monitor_process():
                 stream_state.process = None
                 stream_state.started_at = None
     else:
-        logger.warning("FFmpeg process exited. Stream marked offline.")
+        logger.warning("FFmpeg process exited. Stream offline.")
         with _state_lock:
             stream_state.process = None
             stream_state.is_active = False
@@ -266,7 +315,6 @@ def _launch_ffmpeg(
     fps: int,
     audio_bitrate: str,
 ) -> tuple[bool, str]:
-    """Internal: spawn FFmpeg and set state. NOT lock-protected — caller manages."""
     cmd = build_ffmpeg_command(video_url, stream_key, platform, quality, fps, audio_bitrate)
     logger.info("Launching FFmpeg: %s", " ".join(cmd[:8]) + " …")
     try:
@@ -293,8 +341,11 @@ def _launch_ffmpeg(
         stream_state.started_at  = datetime.now(timezone.utc)
         stream_state.is_active   = True
 
-    watcher = threading.Thread(target=_monitor_process, daemon=True)
-    watcher.start()
+    # Start stderr reader for live health stats
+    threading.Thread(target=_read_ffmpeg_stderr, args=(proc,), daemon=True).start()
+    # Start watcher for exit/reconnect
+    threading.Thread(target=_monitor_process, daemon=True).start()
+
     logger.info("FFmpeg started (PID=%s)", proc.pid)
     return True, f"Stream started (PID={proc.pid})."
 
@@ -303,7 +354,7 @@ def start_stream(
     video_url: str,
     stream_key: str,
     platform: str = "youtube",
-    quality: str = "1080p",
+    quality: str = "480p",
     fps: int = 30,
     audio_bitrate: str = "128k",
     auto_reconnect: bool = False,
@@ -321,7 +372,7 @@ def stop_stream() -> tuple[bool, str]:
         if not stream_state.is_active or stream_state.process is None:
             return False, "No active stream to stop."
         proc = stream_state.process
-        stream_state.auto_reconnect = False  # prevent auto-restart on manual stop
+        stream_state.auto_reconnect = False
 
     logger.info("Stopping FFmpeg (PID=%s)…", proc.pid)
     try:
@@ -340,7 +391,6 @@ def stop_stream() -> tuple[bool, str]:
     except (ProcessLookupError, PermissionError):
         pass
 
-    # Clean up uploaded file if used
     with _state_lock:
         uploaded = stream_state.uploaded_file
         stream_state.process      = None
@@ -353,10 +403,10 @@ def stop_stream() -> tuple[bool, str]:
     if uploaded and uploaded.exists():
         try:
             uploaded.unlink()
-            logger.info("Cleaned up uploaded file: %s", uploaded)
         except Exception:
             pass
 
+    ffmpeg_live_stats["health"] = "offline"
     return True, "Stream stopped."
 
 
@@ -397,7 +447,7 @@ def route_start():
     stream_key    = (data.get("key")          or "").strip()
     source_type   = (data.get("source_type")  or "direct").strip()
     platform      = (data.get("platform")     or "youtube").strip()
-    quality       = (data.get("quality")      or "1080p").strip()
+    quality       = (data.get("quality")      or "480p").strip()
     fps           = int(data.get("fps", 30))
     audio_bitrate = (data.get("audio_bitrate") or "128k").strip()
     auto_reconnect = str(data.get("auto_reconnect", "false")).lower() == "true"
@@ -409,15 +459,14 @@ def route_start():
     if platform not in PLATFORM_RTMP:
         return jsonify({"success": False, "message": f"Unknown platform: {platform}"}), 400
     if quality not in QUALITY_PRESETS:
-        quality = "1080p"
+        quality = "480p"
 
-    # Resolve URL based on source type
     if source_type != "upload":
         video_url, err = resolve_video_url(raw_url, source_type)
         if err:
             return jsonify({"success": False, "message": err}), 400
     else:
-        video_url = raw_url  # Already resolved path from upload endpoint
+        video_url = raw_url
 
     success, message = start_stream(
         video_url, stream_key, platform, quality, fps, audio_bitrate, auto_reconnect
@@ -444,6 +493,11 @@ def route_status():
         key_raw  = stream_state.stream_key
         key_m    = ("*" * 6 + key_raw[-4:]) if len(key_raw) > 4 else "****"
 
+        title     = stream_state.title
+        desc      = stream_state.description
+        tags      = stream_state.tags
+        thumb_url = f"/thumbnail/{Path(stream_state.thumbnail_path).name}" if stream_state.thumbnail_path else None
+
     stats = get_system_stats()
     return jsonify({
         "is_active":         active,
@@ -455,31 +509,36 @@ def route_status():
         "fps":               fps,
         "auto_reconnect":    auto_r,
         "stream_key_masked": key_m if active else "",
+        "seo": {
+            "title": title,
+            "description": desc,
+            "tags": tags,
+            "thumbnail_url": thumb_url,
+        },
+        "live_stats":        ffmpeg_live_stats,
         **stats,
     })
 
 
 @app.route("/upload", methods=["POST"])
 def route_upload():
-    """Upload a video file from the user's PC."""
     if "file" not in request.files:
-        return jsonify({"success": False, "message": "No file part in request."}), 400
+        return jsonify({"success": False, "message": "No file part."}), 400
 
     f = request.files["file"]
     if f.filename == "":
         return jsonify({"success": False, "message": "No file selected."}), 400
 
-    # Check content length
     f.seek(0, 2)
     size = f.tell()
     f.seek(0)
     if size > MAX_UPLOAD_BYTES:
-        return jsonify({"success": False, "message": f"File too large (max 2 GB)."}), 413
+        return jsonify({"success": False, "message": "File exceeds 2 GB limit."}), 413
 
     ext = Path(f.filename).suffix.lower()
     allowed = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".m4v", ".ts"}
     if ext not in allowed:
-        return jsonify({"success": False, "message": f"File type '{ext}' not allowed."}), 400
+        return jsonify({"success": False, "message": f"Format {ext} not supported."}), 400
 
     unique_name = f"{uuid.uuid4().hex}{ext}"
     save_path   = UPLOAD_DIR / unique_name
@@ -488,7 +547,6 @@ def route_upload():
     with _state_lock:
         stream_state.uploaded_file = save_path
 
-    logger.info("File uploaded: %s (%d bytes)", save_path, size)
     return jsonify({
         "success":   True,
         "message":   f"File uploaded: {f.filename}",
@@ -498,15 +556,70 @@ def route_upload():
     })
 
 
+@app.route("/upload-thumbnail", methods=["POST"])
+def route_upload_thumbnail():
+    """Upload custom thumbnail for YouTube Live stream."""
+    if "file" not in request.files:
+        return jsonify({"success": False, "message": "No image file provided."}), 400
+
+    f = request.files["file"]
+    if f.filename == "":
+        return jsonify({"success": False, "message": "No file selected."}), 400
+
+    ext = Path(f.filename).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
+        return jsonify({"success": False, "message": "Thumbnail must be JPG, PNG, or WEBP."}), 400
+
+    unique_name = f"thumb_{uuid.uuid4().hex}{ext}"
+    save_path   = THUMB_DIR / unique_name
+    f.save(save_path)
+
+    with _state_lock:
+        stream_state.thumbnail_path = str(save_path)
+
+    return jsonify({
+        "success": True,
+        "message": "Thumbnail uploaded successfully!",
+        "thumbnail_url": f"/thumbnail/{unique_name}",
+    })
+
+
+@app.route("/thumbnail/<filename>")
+def route_get_thumbnail(filename):
+    from flask import send_from_directory
+    return send_from_directory(THUMB_DIR, filename)
+
+
+@app.route("/save-seo", methods=["POST"])
+def route_save_seo():
+    """Save YouTube Live Stream SEO title, description, tags."""
+    data = request.get_json(silent=True) or request.form
+    title = (data.get("title") or "").strip()
+    desc  = (data.get("description") or "").strip()
+    tags  = (data.get("tags") or "").strip()
+
+    with _state_lock:
+        if title: stream_state.title = title
+        if desc:  stream_state.description = desc
+        if tags:  stream_state.tags = tags
+
+    return jsonify({
+        "success": True,
+        "message": "SEO metadata updated!",
+        "title": stream_state.title,
+        "description": stream_state.description,
+        "tags": stream_state.tags,
+    })
+
+
 @app.route("/resolve-url", methods=["POST"])
 def route_resolve_url():
-    """Resolve a GDrive / Dropbox / YouTube URL to a direct download link."""
     data        = request.get_json(silent=True) or {}
     raw_url     = (data.get("url")         or "").strip()
     source_type = (data.get("source_type") or "").strip()
 
     if not raw_url:
-        return jsonify({"success": False, "message": "URL is required."}), 400
+        return jsonify({"success": False, "message": "URL required."}), 400
 
     resolved, err = resolve_video_url(raw_url, source_type)
     if err:
@@ -516,7 +629,7 @@ def route_resolve_url():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Dashboard HTML — Professional Dark UI
+# Dashboard HTML — Pro Dashboard with Live Stats Monitor & YouTube SEO Engine
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -524,11 +637,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>YouTube 24/7 Live Streamer — Pro Dashboard</title>
-  <meta name="description" content="Professional 24/7 YouTube live streaming control panel powered by FFmpeg. Upload videos, connect cloud storage, and stream to any platform."/>
+  <title>YouTube 24/7 Live Streamer — Pro Dashboard & SEO Suite</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet"/>
   <script>
     tailwind.config = {
@@ -537,128 +648,148 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     };
   </script>
   <style>
-    :root{--bg:#080d1c;--card:rgba(255,255,255,0.04);--border:rgba(255,255,255,0.08);--text:#e2e8f0;--muted:#64748b}
+    :root{--bg:#060b18;--card:rgba(255,255,255,0.04);--border:rgba(255,255,255,0.08);--text:#e2e8f0}
     *{box-sizing:border-box}
     body{background:linear-gradient(135deg,#060b18 0%,#0b1630 50%,#07121f 100%);min-height:100vh;color:var(--text)}
     .glass{background:var(--card);backdrop-filter:blur(20px);border:1px solid var(--border)}
-    .glass-strong{background:rgba(255,255,255,0.06);backdrop-filter:blur(24px);border:1px solid rgba(255,255,255,0.12)}
+    .glass-strong{background:rgba(255,255,255,0.07);backdrop-filter:blur(24px);border:1px solid rgba(255,255,255,0.14)}
     .glow-blue{box-shadow:0 0 40px rgba(56,189,248,0.12),0 0 80px rgba(56,189,248,0.04)}
     .glow-green{box-shadow:0 0 30px rgba(34,197,94,0.2)}
-    /* Status dot */
-    .dot-live{width:12px;height:12px;border-radius:50%;background:#22c55e;box-shadow:0 0 12px #22c55e;animation:pulse 1.5s infinite}
-    .dot-offline{width:12px;height:12px;border-radius:50%;background:#ef4444;box-shadow:0 0 8px #ef4444}
+    
+    /* Live Status Health Indicators */
+    .health-good{background:rgba(34,197,94,0.15);border:1px solid rgba(34,197,94,0.4);color:#4ade80}
+    .health-warning{background:rgba(234,179,8,0.15);border:1px solid rgba(234,179,8,0.4);color:#facc15}
+    .health-poor{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.4);color:#f87171}
+    .health-offline{background:rgba(100,116,139,0.15);border:1px solid rgba(100,116,139,0.4);color:#94a3b8}
+
+    .dot-good{width:12px;height:12px;border-radius:50%;background:#22c55e;box-shadow:0 0 12px #22c55e;animation:pulse 1.5s infinite}
+    .dot-warning{width:12px;height:12px;border-radius:50%;background:#eab308;box-shadow:0 0 12px #eab308;animation:pulse 1.5s infinite}
+    .dot-poor{width:12px;height:12px;border-radius:50%;background:#ef4444;box-shadow:0 0 12px #ef4444;animation:pulse 1s infinite}
+    .dot-offline{width:12px;height:12px;border-radius:50%;background:#64748b}
+
     /* Tabs */
     .src-tab{padding:8px 16px;border-radius:10px;font-size:.8rem;font-weight:600;cursor:pointer;transition:all .2s;color:#64748b;border:1px solid transparent;display:flex;align-items:center;gap:6px;white-space:nowrap}
     .src-tab:hover{color:#94a3b8;background:rgba(255,255,255,0.04)}
     .src-tab.active{background:linear-gradient(135deg,rgba(56,189,248,0.15),rgba(139,92,246,0.15));border-color:rgba(56,189,248,0.3);color:#38bdf8}
-    /* Platform buttons */
-    .plat-btn{padding:10px 18px;border-radius:12px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;border:1px solid var(--border);color:#64748b;display:flex;align-items:center;gap:8px;flex:1;justify-content:center}
-    .plat-btn:hover{border-color:rgba(255,255,255,0.2);color:#94a3b8}
+
+    /* Buttons & Cards */
+    .plat-btn{padding:10px 16px;border-radius:12px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;border:1px solid var(--border);color:#64748b;display:flex;align-items:center;gap:8px;flex:1;justify-content:center}
     .plat-btn.active{border-color:rgba(56,189,248,0.5);color:#38bdf8;background:rgba(56,189,248,0.08)}
-    /* Quality cards */
+    
     .q-card{padding:10px 14px;border-radius:12px;cursor:pointer;transition:all .2s;border:1px solid var(--border);text-align:center;flex:1}
     .q-card:hover{border-color:rgba(255,255,255,0.2)}
-    .q-card.active{border-color:rgba(139,92,246,0.5);background:rgba(139,92,246,0.08)}
+    .q-card.active{border-color:rgba(139,92,246,0.5);background:rgba(139,92,246,0.1)}
     .q-card .label{font-size:.75rem;font-weight:700;color:#a78bfa}
     .q-card .sub{font-size:.65rem;color:#475569;margin-top:2px}
-    /* Inputs */
+
     .inp{width:100%;background:rgba(255,255,255,0.04);border:1px solid var(--border);color:var(--text);border-radius:12px;padding:12px 16px;font-size:.875rem;transition:all .2s;outline:none}
     .inp:focus{border-color:rgba(56,189,248,0.5);box-shadow:0 0 0 3px rgba(56,189,248,0.1);background:rgba(255,255,255,0.06)}
-    .inp::placeholder{color:#334155}
-    /* Buttons */
+
     .btn-start{background:linear-gradient(135deg,#059669,#047857);border:none;color:#fff;padding:14px 24px;border-radius:14px;font-weight:700;font-size:.9rem;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px;width:100%}
     .btn-start:hover:not(:disabled){background:linear-gradient(135deg,#10b981,#059669);transform:translateY(-2px);box-shadow:0 12px 30px rgba(5,150,105,.4)}
     .btn-stop{background:linear-gradient(135deg,#dc2626,#b91c1c);border:none;color:#fff;padding:14px 24px;border-radius:14px;font-weight:700;font-size:.9rem;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px;width:100%}
     .btn-stop:hover:not(:disabled){background:linear-gradient(135deg,#ef4444,#dc2626);transform:translateY(-2px);box-shadow:0 12px 30px rgba(220,38,38,.4)}
     button:disabled{opacity:.45;cursor:not-allowed;transform:none!important}
-    /* Progress bars */
-    .pbar{height:5px;border-radius:3px;background:rgba(255,255,255,0.08);overflow:hidden}
-    .pbar-fill{height:100%;border-radius:3px;transition:width .6s ease}
-    /* Toggle switch */
+
+    .pbar{height:6px;border-radius:4px;background:rgba(255,255,255,0.08);overflow:hidden}
+    .pbar-fill{height:100%;border-radius:4px;transition:width .5s ease}
+
     .toggle{position:relative;width:44px;height:24px;flex-shrink:0}
     .toggle input{opacity:0;width:0;height:0}
     .toggle-slider{position:absolute;cursor:pointer;inset:0;background:rgba(255,255,255,0.1);border-radius:24px;transition:.3s;border:1px solid var(--border)}
     .toggle-slider:before{content:"";position:absolute;width:18px;height:18px;left:2px;top:2px;background:#64748b;border-radius:50%;transition:.3s}
     input:checked + .toggle-slider{background:rgba(56,189,248,0.2);border-color:rgba(56,189,248,0.4)}
     input:checked + .toggle-slider:before{transform:translateX(20px);background:#38bdf8}
-    /* Upload zone */
-    .upload-zone{border:2px dashed rgba(56,189,248,0.25);border-radius:16px;padding:36px 20px;text-align:center;cursor:pointer;transition:all .3s;background:rgba(56,189,248,0.02)}
-    .upload-zone:hover,.upload-zone.drag-over{border-color:rgba(56,189,248,0.5);background:rgba(56,189,248,0.06)}
-    /* Toast */
-    .toast{position:fixed;bottom:24px;right:24px;z-index:100;min-width:300px;animation:slideUp .3s ease}
+
+    .upload-zone{border:2px dashed rgba(56,189,248,0.25);border-radius:16px;padding:30px 20px;text-align:center;cursor:pointer;transition:all .3s;background:rgba(56,189,248,0.02)}
+    .upload-zone:hover{border-color:rgba(56,189,248,0.5);background:rgba(56,189,248,0.06)}
+
+    .toast{position:fixed;bottom:24px;right:24px;z-index:100;min-width:320px;animation:slideUp .3s ease}
     @keyframes slideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
-    @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-    .fade-in{animation:fadeIn .4s ease}
-    /* Grid background */
-    body::before{content:"";position:fixed;inset:0;opacity:.04;background-image:radial-gradient(circle,#4f9cf8 1px,transparent 1px);background-size:36px 36px;pointer-events:none}
-    /* Section label */
-    .sec-label{font-size:.7rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#334155;margin-bottom:12px}
-    /* Badge */
-    .badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:20px;font-size:.72rem;font-weight:600}
+    .sec-label{font-size:.72rem;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:#475569;margin-bottom:12px}
   </style>
 </head>
-<body class="font-sans antialiased">
+<body class="font-sans antialiased p-4 lg:p-8">
 
-<div class="min-h-screen p-4 lg:p-8 max-w-6xl mx-auto">
+<div class="max-w-6xl mx-auto space-y-6">
 
   <!-- Header -->
-  <header class="text-center mb-8 fade-in">
-    <div class="inline-flex items-center gap-4 mb-2">
+  <header class="text-center mb-6">
+    <div class="inline-flex items-center gap-4">
       <span class="text-5xl">🎥</span>
       <div class="text-left">
-        <h1 class="text-4xl lg:text-5xl font-black bg-gradient-to-r from-sky-400 via-blue-400 to-violet-500 bg-clip-text text-transparent leading-tight">24/7 Live Streamer</h1>
-        <p class="text-slate-500 text-sm font-medium">Pro Dashboard · Powered by FFmpeg</p>
+        <h1 class="text-3xl lg:text-4xl font-black bg-gradient-to-r from-sky-400 via-blue-400 to-violet-500 bg-clip-text text-transparent">24/7 Live Streamer Pro</h1>
+        <p class="text-slate-500 text-xs font-semibold">Real-time FFmpeg Health Monitor & YouTube SEO Suite</p>
       </div>
     </div>
   </header>
 
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
-
-    <!-- LEFT COLUMN -->
-    <div class="lg:col-span-2 space-y-5">
-
-      <!-- Status Card -->
-      <div class="glass rounded-2xl p-5 glow-blue fade-in">
-        <div class="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <div class="sec-label">Stream Status</div>
-            <div class="flex items-center gap-3">
-              <span id="status-dot" class="dot-offline"></span>
-              <span id="status-text" class="text-2xl font-black text-red-400">🔴 Offline</span>
-            </div>
-            <div class="flex flex-wrap gap-4 mt-2">
-              <span class="text-slate-500 text-sm" id="uptime-text">Uptime: N/A</span>
-              <span class="text-slate-600 text-sm font-mono" id="pid-text"></span>
-            </div>
-          </div>
-          <div class="flex flex-wrap gap-2" id="active-badges"></div>
+  <!-- LIVE HEALTH MONITOR PANEL -->
+  <div class="glass rounded-2xl p-5 glow-blue">
+    <div class="flex flex-wrap items-center justify-between gap-4 mb-4">
+      <div>
+        <div class="sec-label">📡 Real-Time Stream & Health Monitor</div>
+        <div class="flex items-center gap-3">
+          <span id="status-dot" class="dot-offline"></span>
+          <span id="status-text" class="text-2xl font-black text-slate-400">Offline</span>
+          <span id="health-badge" class="px-3 py-1 rounded-full text-xs font-bold health-offline">STATIONARY</span>
         </div>
       </div>
-
-      <!-- Metrics -->
-      <div class="grid grid-cols-2 gap-4 fade-in">
-        <div class="glass rounded-2xl p-4">
-          <div class="flex justify-between items-center mb-3">
-            <span class="text-slate-400 text-sm font-semibold">⚡ CPU</span>
-            <span id="cpu-pct" class="text-sky-400 font-black text-lg">0%</span>
-          </div>
-          <div class="pbar"><div id="cpu-bar" class="pbar-fill bg-gradient-to-r from-sky-500 to-blue-400" style="width:0%"></div></div>
-        </div>
-        <div class="glass rounded-2xl p-4">
-          <div class="flex justify-between items-center mb-3">
-            <span class="text-slate-400 text-sm font-semibold">🧠 RAM</span>
-            <span id="ram-pct" class="text-violet-400 font-black text-lg">0%</span>
-          </div>
-          <div class="pbar"><div id="ram-bar" class="pbar-fill bg-gradient-to-r from-violet-500 to-purple-400" style="width:0%"></div></div>
-          <p id="ram-detail" class="text-slate-600 text-xs mt-2">— MB / — MB</p>
-        </div>
+      <div class="text-right">
+        <p id="uptime-text" class="text-slate-400 text-sm font-bold">Uptime: N/A</p>
+        <p id="pid-text" class="text-slate-600 text-xs font-mono"></p>
       </div>
+    </div>
+
+    <!-- Live FFmpeg Real-Time Metrics -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="glass rounded-xl p-3 text-center">
+        <p class="text-slate-500 text-xs font-bold">ENCODING FPS</p>
+        <p id="stat-fps" class="text-2xl font-black text-sky-400 mt-1">0.0</p>
+      </div>
+      <div class="glass rounded-xl p-3 text-center">
+        <p class="text-slate-500 text-xs font-bold">BITRATE</p>
+        <p id="stat-bitrate" class="text-2xl font-black text-emerald-400 mt-1">0 kbits/s</p>
+      </div>
+      <div class="glass rounded-xl p-3 text-center">
+        <p class="text-slate-500 text-xs font-bold">STREAM SPEED</p>
+        <p id="stat-speed" class="text-2xl font-black text-violet-400 mt-1">0.0x</p>
+      </div>
+      <div class="glass rounded-xl p-3 text-center">
+        <p class="text-slate-500 text-xs font-bold">TOTAL FRAMES</p>
+        <p id="stat-frames" class="text-2xl font-black text-amber-400 mt-1">0</p>
+      </div>
+    </div>
+
+    <!-- CPU & RAM -->
+    <div class="grid grid-cols-2 gap-4 mt-4">
+      <div>
+        <div class="flex justify-between text-xs font-semibold mb-1">
+          <span class="text-slate-400">⚡ Server CPU</span>
+          <span id="cpu-pct" class="text-sky-400">0%</span>
+        </div>
+        <div class="pbar"><div id="cpu-bar" class="pbar-fill bg-sky-400" style="width:0%"></div></div>
+      </div>
+      <div>
+        <div class="flex justify-between text-xs font-semibold mb-1">
+          <span class="text-slate-400">🧠 Server RAM</span>
+          <span id="ram-pct" class="text-violet-400">0%</span>
+        </div>
+        <div class="pbar"><div id="ram-bar" class="pbar-fill bg-violet-400" style="width:0%"></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MAIN TWO-COLUMN LAYOUT -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+    <!-- LEFT COLUMN: CONTROLS & SOURCES -->
+    <div class="lg:col-span-2 space-y-6">
 
       <!-- VIDEO SOURCE -->
-      <div class="glass rounded-2xl p-5 fade-in">
-        <div class="sec-label">📹 Video Source</div>
-        <!-- Source Tabs -->
-        <div class="flex flex-wrap gap-2 mb-5 overflow-x-auto pb-1">
+      <div class="glass rounded-2xl p-5">
+        <div class="sec-label">📹 Video Source Selection</div>
+        <div class="flex flex-wrap gap-2 mb-4 overflow-x-auto pb-1">
           <button class="src-tab active" onclick="switchTab('direct')"   id="tab-direct">   🔗 Direct URL</button>
           <button class="src-tab"        onclick="switchTab('upload')"   id="tab-upload">   📁 Upload PC</button>
           <button class="src-tab"        onclick="switchTab('gdrive')"   id="tab-gdrive">   ☁️ Google Drive</button>
@@ -666,61 +797,57 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <button class="src-tab"        onclick="switchTab('youtube')"  id="tab-youtube">  🎬 YouTube</button>
         </div>
 
-        <!-- Tab Panels -->
         <div id="panel-direct">
-          <label class="block text-slate-400 text-xs font-semibold mb-2">Direct video link (MP4 / MKV / HLS / DASH)</label>
+          <label class="block text-slate-400 text-xs font-semibold mb-2">Direct Video File / Stream URL</label>
           <input id="url-direct" class="inp" type="url" placeholder="https://cdn.example.com/video.mp4"/>
         </div>
 
         <div id="panel-upload" style="display:none">
-          <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()"
-               ondragover="ev.preventDefault();this.classList.add('drag-over')"
-               ondragleave="this.classList.remove('drag-over')"
-               ondrop="handleDrop(event)">
-            <div class="text-4xl mb-3">📁</div>
-            <p class="text-slate-400 font-semibold text-sm">Drag & drop or click to browse</p>
-            <p class="text-slate-600 text-xs mt-1">MP4, MKV, AVI, MOV, FLV, WebM · Max 2 GB</p>
-            <div id="upload-status" class="mt-3 text-sky-400 text-sm font-semibold hidden"></div>
+          <div class="upload-zone" onclick="document.getElementById('file-input').click()">
+            <div class="text-3xl mb-2">📁</div>
+            <p class="text-slate-300 font-bold text-sm">Click to select MP4/MKV video file from PC</p>
+            <p class="text-slate-500 text-xs mt-1">Supports up to 2 GB video files</p>
+            <p id="upload-status" class="mt-2 text-sky-400 text-xs font-bold hidden"></p>
           </div>
           <input id="file-input" type="file" accept="video/*,.mkv,.flv,.ts" class="hidden" onchange="handleFileSelect(this)"/>
           <input id="url-upload" type="hidden"/>
         </div>
 
         <div id="panel-gdrive" style="display:none">
-          <label class="block text-slate-400 text-xs font-semibold mb-2">Google Drive share link</label>
+          <label class="block text-slate-400 text-xs font-semibold mb-2">Google Drive Shareable Link</label>
           <div class="flex gap-2">
             <input id="url-gdrive" class="inp" type="url" placeholder="https://drive.google.com/file/d/FILE_ID/view"/>
-            <button onclick="resolveURL('gdrive')" class="px-4 py-3 glass rounded-xl text-sky-400 text-sm font-semibold whitespace-nowrap hover:bg-white/5 transition-all">Resolve →</button>
+            <button onclick="resolveURL('gdrive')" class="px-4 py-2 glass rounded-xl text-sky-400 font-bold text-xs">Resolve →</button>
           </div>
           <p id="gdrive-resolved" class="text-emerald-400 text-xs mt-2 hidden"></p>
         </div>
 
         <div id="panel-dropbox" style="display:none">
-          <label class="block text-slate-400 text-xs font-semibold mb-2">Dropbox share link</label>
+          <label class="block text-slate-400 text-xs font-semibold mb-2">Dropbox Link</label>
           <div class="flex gap-2">
             <input id="url-dropbox" class="inp" type="url" placeholder="https://www.dropbox.com/s/xxx/video.mp4?dl=0"/>
-            <button onclick="resolveURL('dropbox')" class="px-4 py-3 glass rounded-xl text-sky-400 text-sm font-semibold whitespace-nowrap hover:bg-white/5 transition-all">Resolve →</button>
+            <button onclick="resolveURL('dropbox')" class="px-4 py-2 glass rounded-xl text-sky-400 font-bold text-xs">Resolve →</button>
           </div>
           <p id="dropbox-resolved" class="text-emerald-400 text-xs mt-2 hidden"></p>
         </div>
 
         <div id="panel-youtube" style="display:none">
-          <label class="block text-slate-400 text-xs font-semibold mb-2">YouTube video URL (yt-dlp will extract stream)</label>
+          <label class="block text-slate-400 text-xs font-semibold mb-2">YouTube Video URL</label>
           <div class="flex gap-2">
             <input id="url-youtube" class="inp" type="url" placeholder="https://www.youtube.com/watch?v=VIDEO_ID"/>
-            <button onclick="resolveURL('youtube')" class="px-4 py-3 glass rounded-xl text-sky-400 text-sm font-semibold whitespace-nowrap hover:bg-white/5 transition-all">Extract →</button>
+            <button onclick="resolveURL('youtube')" class="px-4 py-2 glass rounded-xl text-sky-400 font-bold text-xs">Extract →</button>
           </div>
-          <p id="youtube-resolved" class="text-slate-500 text-xs mt-2">⚠️ May take ~30 seconds to resolve via yt-dlp</p>
+          <p id="youtube-resolved" class="text-slate-500 text-xs mt-2">Extracts direct video stream link via yt-dlp</p>
         </div>
       </div>
 
-      <!-- STREAM SETTINGS -->
-      <div class="glass rounded-2xl p-5 fade-in">
-        <div class="sec-label">🎛️ Stream Settings</div>
+      <!-- STREAM CONFIG -->
+      <div class="glass rounded-2xl p-5">
+        <div class="sec-label">🎛️ Streaming Setup</div>
 
         <!-- Platform -->
-        <div class="mb-5">
-          <label class="block text-slate-400 text-xs font-semibold mb-3">Streaming Platform</label>
+        <div class="mb-4">
+          <label class="block text-slate-400 text-xs font-semibold mb-2">Target Platform</label>
           <div class="flex flex-wrap gap-2">
             <button class="plat-btn active" onclick="setPlatform('youtube')"  id="plat-youtube">  📺 YouTube</button>
             <button class="plat-btn"        onclick="setPlatform('facebook')" id="plat-facebook"> 📘 Facebook</button>
@@ -729,127 +856,123 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Stream Key / Custom RTMP -->
-        <div class="mb-5">
+        <!-- Key / Custom -->
+        <div class="mb-4">
           <label class="block text-slate-400 text-xs font-semibold mb-2" id="key-label">🔑 Stream Key</label>
           <input id="stream-key" class="inp font-mono" type="password" placeholder="xxxx-xxxx-xxxx-xxxx-xxxx"/>
-          <div id="custom-rtmp-wrap" class="mt-3 hidden">
-            <label class="block text-slate-400 text-xs font-semibold mb-2">Custom RTMP URL (include key)</label>
-            <input id="custom-rtmp" class="inp font-mono" type="text" placeholder="rtmp://your-server.com/live/YOUR_STREAM_KEY"/>
+          <div id="custom-rtmp-wrap" class="mt-2 hidden">
+            <label class="block text-slate-400 text-xs font-semibold mb-1">Custom RTMP URL</label>
+            <input id="custom-rtmp" class="inp font-mono" type="text" placeholder="rtmp://server.com/live/YOUR_KEY"/>
           </div>
         </div>
 
-        <!-- Quality -->
-        <div class="mb-5">
-          <label class="block text-slate-400 text-xs font-semibold mb-3">Video Quality</label>
-          <div class="flex flex-wrap gap-2">
-            <div class="q-card active" onclick="setQuality('480p')"     id="q-480p">     <div class="label">480p ⭐</div>  <div class="sub">1.5 Mbps · Stable</div></div>
-            <div class="q-card" onclick="setQuality('720p')"     id="q-720p">     <div class="label">720p</div>    <div class="sub">2.5 Mbps</div></div>
-            <div class="q-card" onclick="setQuality('1080p')"   id="q-1080p">   <div class="label">1080p</div>   <div class="sub">4 Mbps</div></div>
-            <div class="q-card" onclick="setQuality('1080p_hq')" id="q-1080p_hq"> <div class="label">1080p HQ</div><div class="sub">6 Mbps</div></div>
-            <div class="q-card" onclick="setQuality('4k')"       id="q-4k">       <div class="label">4K Ultra</div><div class="sub">8 Mbps</div></div>
+        <!-- Quality Preset -->
+        <div class="mb-4">
+          <label class="block text-slate-400 text-xs font-semibold mb-2">Quality Preset (480p is recommended for free tier stability)</label>
+          <div class="grid grid-cols-2 md:grid-cols-5 gap-2">
+            <div class="q-card active" onclick="setQuality('480p')"     id="q-480p">     <div class="label">480p ⭐</div>  <div class="sub">1.5 Mbps</div></div>
+            <div class="q-card"        onclick="setQuality('720p')"     id="q-720p">     <div class="label">720p</div>    <div class="sub">2.5 Mbps</div></div>
+            <div class="q-card"        onclick="setQuality('1080p')"   id="q-1080p">   <div class="label">1080p</div>   <div class="sub">4 Mbps</div></div>
+            <div class="q-card"        onclick="setQuality('1080p_hq')" id="q-1080p_hq"> <div class="label">1080p HQ</div><div class="sub">6 Mbps</div></div>
+            <div class="q-card"        onclick="setQuality('4k')"       id="q-4k">       <div class="label">4K Ultra</div><div class="sub">8 Mbps</div></div>
           </div>
         </div>
 
-        <!-- FPS + Audio -->
-        <div class="grid grid-cols-2 gap-4 mb-5">
+        <!-- Auto Reconnect -->
+        <div class="flex items-center justify-between glass rounded-xl p-3">
           <div>
-            <label class="block text-slate-400 text-xs font-semibold mb-2">Frame Rate</label>
-            <div class="flex gap-2">
-              <button onclick="setFPS(30)"  id="fps-30"  class="plat-btn active text-sm flex-1">30 FPS</button>
-              <button onclick="setFPS(60)"  id="fps-60"  class="plat-btn text-sm flex-1">60 FPS</button>
-            </div>
-          </div>
-          <div>
-            <label class="block text-slate-400 text-xs font-semibold mb-2">Audio Quality</label>
-            <select id="audio-bitrate" class="inp" style="padding:10px 14px">
-              <option value="128k">128k — Standard</option>
-              <option value="192k">192k — High</option>
-              <option value="320k">320k — Lossless</option>
-            </select>
-          </div>
-        </div>
-
-        <!-- Auto-reconnect -->
-        <div class="flex items-center justify-between glass rounded-xl p-4">
-          <div>
-            <p class="text-slate-300 text-sm font-semibold">🔄 Auto-Reconnect</p>
-            <p class="text-slate-600 text-xs mt-0.5">Restart stream automatically if FFmpeg crashes</p>
+            <p class="text-slate-200 text-xs font-bold">🔄 Auto-Reconnect 24/7</p>
+            <p class="text-slate-500 text-xs">Automatically restarts stream if connection drops</p>
           </div>
           <label class="toggle">
-            <input type="checkbox" id="auto-reconnect"/>
+            <input type="checkbox" id="auto-reconnect" checked/>
             <span class="toggle-slider"></span>
           </label>
         </div>
       </div>
 
-      <!-- Action Buttons -->
-      <div class="grid grid-cols-2 gap-4 fade-in">
-        <button id="btn-start" onclick="startStream()" class="btn-start">
-          <span>▶️</span> Start 24/7 Stream
-        </button>
-        <button id="btn-stop" onclick="stopStream()" class="btn-stop">
-          <span>⏹️</span> Stop Stream
-        </button>
+      <!-- STREAM ACTIONS -->
+      <div class="grid grid-cols-2 gap-4">
+        <button id="btn-start" onclick="startStream()" class="btn-start">▶️ Start 24/7 Stream</button>
+        <button id="btn-stop"  onclick="stopStream()"  class="btn-stop">⏹️ Stop Stream</button>
       </div>
+
     </div>
 
-    <!-- RIGHT COLUMN -->
-    <div class="space-y-5">
+    <!-- RIGHT COLUMN: YOUTUBE LIVE SEO & THUMBNAIL SUITE -->
+    <div class="space-y-6">
 
-      <!-- Active Stream Info -->
-      <div class="glass rounded-2xl p-5 fade-in" id="stream-info-card" style="display:none">
-        <div class="sec-label">📡 Active Stream</div>
-        <div class="space-y-3 text-sm">
-          <div class="flex justify-between"><span class="text-slate-500">Platform</span><span id="info-platform" class="text-slate-300 font-semibold capitalize">—</span></div>
-          <div class="flex justify-between"><span class="text-slate-500">Quality</span><span id="info-quality"   class="text-slate-300 font-semibold">—</span></div>
-          <div class="flex justify-between"><span class="text-slate-500">FPS</span>    <span id="info-fps"      class="text-slate-300 font-semibold">—</span></div>
-          <div class="flex justify-between"><span class="text-slate-500">Auto-Reconnect</span><span id="info-ar" class="font-semibold">—</span></div>
+      <!-- THUMBNAIL UPLOADER & PREVIEW -->
+      <div class="glass rounded-2xl p-5">
+        <div class="sec-label">🖼️ Stream Thumbnail Manager</div>
+        <div class="text-center mb-3">
+          <div id="thumb-preview-box" class="w-full h-36 rounded-xl border border-slate-700 bg-slate-900/60 flex items-center justify-center overflow-hidden">
+            <span id="thumb-placeholder" class="text-slate-600 text-xs">No Thumbnail Uploaded</span>
+            <img id="thumb-img" class="w-full h-full object-cover hidden" alt="Thumbnail Preview"/>
+          </div>
+        </div>
+        <button onclick="document.getElementById('thumb-input').click()" class="w-full py-2 glass rounded-xl text-sky-400 font-bold text-xs hover:bg-white/5">
+          📤 Upload Custom Stream Thumbnail (JPG/PNG)
+        </button>
+        <input id="thumb-input" type="file" accept="image/*" class="hidden" onchange="uploadThumbnail(this)"/>
+      </div>
+
+      <!-- YOUTUBE LIVE SEO & METADATA SUITE -->
+      <div class="glass rounded-2xl p-5">
+        <div class="sec-label">🚀 YouTube Live SEO Suite</div>
+
+        <!-- SEO AI Auto-Generator -->
+        <div class="mb-4">
+          <button onclick="generateSEO()" class="w-full py-2 bg-gradient-to-r from-violet-600 to-indigo-600 text-white font-bold rounded-xl text-xs hover:opacity-90 transition-all">
+            ✨ Auto-Generate High-Ranking SEO Metadata
+          </button>
+        </div>
+
+        <!-- Stream Title -->
+        <div class="mb-3">
+          <label class="block text-slate-400 text-xs font-bold mb-1">Live Stream Title</label>
+          <input id="seo-title" class="inp text-xs" type="text" placeholder="24/7 Non-Stop Live Stream 🔴"/>
+        </div>
+
+        <!-- Stream Description -->
+        <div class="mb-3">
+          <label class="block text-slate-400 text-xs font-bold mb-1">Description & Socials</label>
+          <textarea id="seo-desc" class="inp text-xs h-24" placeholder="Welcome to our continuous 24/7 stream..."></textarea>
+        </div>
+
+        <!-- Tags -->
+        <div class="mb-4">
+          <label class="block text-slate-400 text-xs font-bold mb-1">SEO Tags (comma separated)</label>
+          <input id="seo-tags" class="inp text-xs font-mono" type="text" placeholder="live, 24/7, streaming, gaming, music"/>
+        </div>
+
+        <!-- Action Buttons -->
+        <div class="space-y-2">
+          <button onclick="saveSEO()" class="w-full py-2.5 bg-sky-500 text-white font-bold rounded-xl text-xs hover:bg-sky-400">
+            💾 Save SEO Settings
+          </button>
+          <button onclick="openYouTubeStudio()" class="w-full py-2 glass text-amber-400 font-bold rounded-xl text-xs hover:bg-white/5">
+            🎬 Open YouTube Live Studio →
+          </button>
         </div>
       </div>
 
-      <!-- Telegram Bot -->
-      <div class="glass rounded-2xl p-5 fade-in">
-        <div class="sec-label">🤖 Telegram Bot Commands</div>
-        <div class="space-y-2 text-xs font-mono">
-          <div class="glass rounded-lg p-2.5"><span class="text-sky-400">/start</span><span class="text-slate-600"> — Help</span></div>
-          <div class="glass rounded-lg p-2.5"><span class="text-sky-400">/stream &lt;url&gt; &lt;key&gt;</span><span class="text-slate-600"> — Start</span></div>
-          <div class="glass rounded-lg p-2.5"><span class="text-sky-400">/stop</span><span class="text-slate-600"> — Stop stream</span></div>
-          <div class="glass rounded-lg p-2.5"><span class="text-sky-400">/status</span><span class="text-slate-600"> — Status & metrics</span></div>
-        </div>
-        <p class="text-slate-700 text-xs mt-3">Set <code class="text-slate-500">TELEGRAM_BOT_TOKEN</code> in Render env vars to activate.</p>
-      </div>
-
-      <!-- Tips -->
-      <div class="glass rounded-2xl p-5 fade-in">
-        <div class="sec-label">💡 Quick Tips</div>
-        <ul class="text-slate-500 text-xs space-y-2">
-          <li>🔗 <strong class="text-slate-400">Direct URL</strong> — most stable for 24/7</li>
-          <li>☁️ <strong class="text-slate-400">Google Drive</strong> — good for large files</li>
-          <li>📁 <strong class="text-slate-400">PC Upload</strong> — temporary (lost on restart)</li>
-          <li>🎬 <strong class="text-slate-400">YouTube</strong> — requires yt-dlp, ~30s delay</li>
-          <li>🔄 <strong class="text-slate-400">Auto-Reconnect</strong> — for 24/7 reliability</li>
-          <li>🔑 Keep stream key secret — never share it</li>
-        </ul>
-      </div>
     </div>
+
   </div>
 </div>
 
 <!-- Toast -->
 <div id="toast" class="toast hidden">
-  <div id="toast-inner" class="glass-strong rounded-2xl px-5 py-4 text-sm font-semibold shadow-2xl"></div>
+  <div id="toast-inner" class="glass-strong rounded-2xl px-5 py-3 text-xs font-bold"></div>
 </div>
 
 <script>
-// ─── State ────────────────────────────────────────────────────────────────────
 let activeTab      = 'direct';
 let activePlatform = 'youtube';
 let activeQuality  = '480p';
-let activeFPS      = 30;
-let resolvedURLs   = {};  // tab -> resolved URL
+let resolvedURLs   = {};
 
-// ─── Tab Switching ─────────────────────────────────────────────────────────────
 function switchTab(tab) {
   ['direct','upload','gdrive','dropbox','youtube'].forEach(t => {
     document.getElementById('panel-' + t).style.display = t === tab ? '' : 'none';
@@ -858,24 +981,14 @@ function switchTab(tab) {
   activeTab = tab;
 }
 
-// ─── Platform Selection ────────────────────────────────────────────────────────
 function setPlatform(p) {
   ['youtube','facebook','twitch','custom'].forEach(x => {
     document.getElementById('plat-' + x).classList.toggle('active', x === p);
   });
   activePlatform = p;
-  const customWrap = document.getElementById('custom-rtmp-wrap');
-  const keyLabel   = document.getElementById('key-label');
-  if (p === 'custom') {
-    customWrap.classList.remove('hidden');
-    keyLabel.textContent = '🔑 Custom RTMP (enter in field below)';
-  } else {
-    customWrap.classList.add('hidden');
-    keyLabel.textContent = '🔑 Stream Key';
-  }
+  document.getElementById('custom-rtmp-wrap').classList.toggle('hidden', p !== 'custom');
 }
 
-// ─── Quality Selection ─────────────────────────────────────────────────────────
 function setQuality(q) {
   ['480p','720p','1080p','1080p_hq','4k'].forEach(x => {
     document.getElementById('q-' + x).classList.toggle('active', x === q);
@@ -883,24 +996,12 @@ function setQuality(q) {
   activeQuality = q;
 }
 
-// ─── FPS Selection ─────────────────────────────────────────────────────────────
-function setFPS(fps) {
-  [30, 60].forEach(f => {
-    document.getElementById('fps-' + f).classList.toggle('active', f === fps);
-  });
-  activeFPS = fps;
-}
-
-// ─── URL Resolver ──────────────────────────────────────────────────────────────
 async function resolveURL(sourceType) {
-  const inputId = 'url-' + sourceType;
-  const statusId = sourceType + '-resolved';
-  const url = document.getElementById(inputId).value.trim();
-  if (!url) { showToast('Please enter a URL first.', 'error'); return; }
+  const url = document.getElementById('url-' + sourceType).value.trim();
+  if (!url) return showToast('Please enter a URL.', 'error');
 
-  const statusEl = document.getElementById(statusId);
-  statusEl.textContent = '⏳ Resolving…';
-  statusEl.className = 'text-slate-400 text-xs mt-2';
+  const statusEl = document.getElementById(sourceType + '-resolved');
+  statusEl.textContent = '⏳ Resolving link…';
   statusEl.classList.remove('hidden');
 
   try {
@@ -912,57 +1013,69 @@ async function resolveURL(sourceType) {
     const data = await res.json();
     if (data.success) {
       resolvedURLs[sourceType] = data.resolved_url;
-      statusEl.textContent = '✅ Resolved! Ready to stream.';
-      statusEl.className = 'text-emerald-400 text-xs mt-2';
+      statusEl.textContent = '✅ Link Ready!';
       showToast('URL resolved successfully!', 'success');
     } else {
       statusEl.textContent = '❌ ' + data.message;
-      statusEl.className = 'text-red-400 text-xs mt-2';
       showToast(data.message, 'error');
     }
   } catch(e) {
     statusEl.textContent = '❌ Network error.';
-    statusEl.className = 'text-red-400 text-xs mt-2';
   }
 }
 
-// ─── File Upload ───────────────────────────────────────────────────────────────
-function handleDrop(ev) {
-  ev.preventDefault();
-  document.getElementById('upload-zone').classList.remove('drag-over');
-  const file = ev.dataTransfer.files[0];
-  if (file) uploadFile(file);
-}
-function handleFileSelect(input) {
-  if (input.files[0]) uploadFile(input.files[0]);
-}
-async function uploadFile(file) {
-  const status = document.getElementById('upload-status');
-  status.textContent = `⏳ Uploading ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)…`;
-  status.classList.remove('hidden');
-
+async function uploadThumbnail(input) {
+  if (!input.files[0]) return;
   const formData = new FormData();
-  formData.append('file', file);
+  formData.append('file', input.files[0]);
 
   try {
-    const res  = await fetch('/upload', { method: 'POST', body: formData });
+    const res = await fetch('/upload-thumbnail', { method: 'POST', body: formData });
     const data = await res.json();
     if (data.success) {
-      resolvedURLs['upload'] = data.file_path;
-      document.getElementById('url-upload').value = data.file_path;
-      status.textContent = `✅ ${data.file_name} (${data.size_mb} MB) — Ready!`;
-      showToast(`File uploaded: ${data.file_name}`, 'success');
+      document.getElementById('thumb-img').src = data.thumbnail_url;
+      document.getElementById('thumb-img').classList.remove('hidden');
+      document.getElementById('thumb-placeholder').classList.add('hidden');
+      showToast('Thumbnail uploaded successfully!', 'success');
     } else {
-      status.textContent = '❌ ' + data.message;
       showToast(data.message, 'error');
     }
   } catch(e) {
-    status.textContent = '❌ Upload failed. Check network.';
-    showToast('Upload failed.', 'error');
+    showToast('Failed to upload thumbnail.', 'error');
   }
 }
 
-// ─── Get Active Video URL ──────────────────────────────────────────────────────
+function generateSEO() {
+  document.getElementById('seo-title').value = "🔴 24/7 Non-Stop Live Stream (HQ 60FPS) | Continuous Stream";
+  document.getElementById('seo-desc').value  = "Welcome to our official 24/7 non-stop continuous live stream!\n\n🔔 Subscribe & Turn on notifications to stay updated.\n\n#Live #247 #Stream #YouTubeLive #NonStop";
+  document.getElementById('seo-tags').value  = "live, 24/7, live stream, 24/7 stream, non stop, youtube live, 60fps, continuous live";
+  showToast('High-ranking SEO Metadata generated!', 'success');
+}
+
+async function saveSEO() {
+  const title = document.getElementById('seo-title').value;
+  const desc  = document.getElementById('seo-desc').value;
+  const tags  = document.getElementById('seo-tags').value;
+
+  try {
+    const res = await fetch('/save-seo', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ title, description: desc, tags }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      showToast('SEO Settings saved!', 'success');
+    }
+  } catch(e) {
+    showToast('Error saving SEO.', 'error');
+  }
+}
+
+function openYouTubeStudio() {
+  window.open('https://studio.youtube.com/channel/UC/livestreaming', '_blank');
+}
+
 function getVideoURL() {
   if (activeTab === 'direct')  return document.getElementById('url-direct').value.trim();
   if (activeTab === 'upload')  return resolvedURLs['upload'] || '';
@@ -972,127 +1085,120 @@ function getVideoURL() {
   return '';
 }
 
-// ─── Start Stream ──────────────────────────────────────────────────────────────
 async function startStream() {
   const url = getVideoURL();
   let key   = document.getElementById('stream-key').value.trim();
-  if (activePlatform === 'custom') {
-    key = document.getElementById('custom-rtmp').value.trim();
-  }
+  if (activePlatform === 'custom') key = document.getElementById('custom-rtmp').value.trim();
 
-  if (!url) { showToast('Please provide a video source.', 'error'); return; }
-  if (!key) { showToast('Please enter your stream key.', 'error'); return; }
+  if (!url) return showToast('Please select or enter a video source.', 'error');
+  if (!key) return showToast('Please enter your stream key.', 'error');
 
-  setLoading('btn-start', true);
   try {
     const res  = await fetch('/start', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
-        url,
-        key,
-        source_type:    activeTab,
-        platform:       activePlatform,
-        quality:        activeQuality,
-        fps:            activeFPS,
-        audio_bitrate:  document.getElementById('audio-bitrate').value,
+        url, key, source_type: activeTab, platform: activePlatform,
+        quality: activeQuality, fps: 30, audio_bitrate: '128k',
         auto_reconnect: document.getElementById('auto-reconnect').checked,
       }),
     });
     const data = await res.json();
     showToast(data.message, data.success ? 'success' : 'error');
   } catch(e) {
-    showToast('Network error. Please try again.', 'error');
-  } finally {
-    setLoading('btn-start', false);
+    showToast('Network error.', 'error');
   }
 }
 
-// ─── Stop Stream ───────────────────────────────────────────────────────────────
 async function stopStream() {
-  setLoading('btn-stop', true);
   try {
-    const res  = await fetch('/stop', { method: 'POST' });
+    const res = await fetch('/stop', { method: 'POST' });
     const data = await res.json();
     showToast(data.message, data.success ? 'success' : 'error');
   } catch(e) {
-    showToast('Network error. Please try again.', 'error');
-  } finally {
-    setLoading('btn-stop', false);
+    showToast('Network error.', 'error');
   }
 }
-
-// ─── Poll Status ───────────────────────────────────────────────────────────────
-const QUALITY_LABELS = {'720p':'720p','1080p':'1080p HD','1080p_hq':'1080p HQ','4k':'4K Ultra'};
-const PLATFORM_LABELS = {'youtube':'📺 YouTube','facebook':'📘 Facebook','twitch':'🟣 Twitch','custom':'🔧 Custom'};
 
 async function pollStatus() {
   try {
     const res  = await fetch('/api/status');
     const d    = await res.json();
+
     const dot  = document.getElementById('status-dot');
     const txt  = document.getElementById('status-text');
-    const up   = document.getElementById('uptime-text');
-    const pid  = document.getElementById('pid-text');
-    const card = document.getElementById('stream-info-card');
-    const bads = document.getElementById('active-badges');
+    const hB   = document.getElementById('health-badge');
+    const stats = d.live_stats || {};
 
     if (d.is_active) {
-      dot.className  = 'dot-live';
-      txt.className  = 'text-2xl font-black text-emerald-400';
-      txt.textContent = '🟢 Live Streaming';
-      up.textContent  = 'Uptime: ' + d.uptime;
-      pid.textContent = d.pid ? 'PID: ' + d.pid : '';
-      card.style.display = '';
-      document.getElementById('info-platform').textContent = d.platform || '—';
-      document.getElementById('info-quality').textContent  = QUALITY_LABELS[d.quality] || d.quality || '—';
-      document.getElementById('info-fps').textContent      = (d.fps || '—') + ' FPS';
-      const arEl = document.getElementById('info-ar');
-      arEl.textContent = d.auto_reconnect ? '✅ ON' : '❌ OFF';
-      arEl.className   = d.auto_reconnect ? 'font-semibold text-emerald-400' : 'font-semibold text-slate-600';
-      bads.innerHTML  = `<span class="badge bg-emerald-400/10 border border-emerald-400/30 text-emerald-400">${QUALITY_LABELS[d.quality]||d.quality}</span>
-                         <span class="badge bg-sky-400/10 border border-sky-400/30 text-sky-400">${d.fps||30} FPS</span>`;
+      txt.textContent = 'Streaming Live';
+      txt.className = 'text-2xl font-black text-emerald-400';
+      document.getElementById('uptime-text').textContent = 'Uptime: ' + d.uptime;
+      document.getElementById('pid-text').textContent    = 'PID: ' + (d.pid || '');
+
+      const health = stats.health || 'good';
+      if (health === 'good') {
+        dot.className = 'dot-good';
+        hB.className  = 'px-3 py-1 rounded-full text-xs font-bold health-good';
+        hB.textContent = '🟢 HEALTH EXCELLENT (1.0x)';
+      } else if (health === 'warning') {
+        dot.className = 'dot-warning';
+        hB.className  = 'px-3 py-1 rounded-full text-xs font-bold health-warning';
+        hB.textContent = '🟡 SLIGHT LAG / BUFFERING';
+      } else {
+        dot.className = 'dot-poor';
+        hB.className  = 'px-3 py-1 rounded-full text-xs font-bold health-poor';
+        hB.textContent = '🔴 POOR SPEED / NETWORK LAG';
+      }
+
+      document.getElementById('stat-fps').textContent     = (stats.fps || 0).toFixed(1);
+      document.getElementById('stat-bitrate').textContent = stats.bitrate || '0 kbits/s';
+      document.getElementById('stat-speed').textContent   = stats.speed || '0.0x';
+      document.getElementById('stat-frames').textContent  = stats.frame || 0;
     } else {
-      dot.className  = 'dot-offline';
-      txt.className  = 'text-2xl font-black text-red-400';
-      txt.textContent = '🔴 Offline';
-      up.textContent  = 'Uptime: N/A';
-      pid.textContent = '';
-      card.style.display = 'none';
-      bads.innerHTML  = '';
+      dot.className = 'dot-offline';
+      txt.className = 'text-2xl font-black text-slate-400';
+      txt.textContent = 'Offline';
+      hB.className  = 'px-3 py-1 rounded-full text-xs font-bold health-offline';
+      hB.textContent = 'STATIONARY';
+      document.getElementById('uptime-text').textContent = 'Uptime: N/A';
+      document.getElementById('pid-text').textContent    = '';
+
+      document.getElementById('stat-fps').textContent     = '0.0';
+      document.getElementById('stat-bitrate').textContent = '0 kbits/s';
+      document.getElementById('stat-speed').textContent   = '0.0x';
+      document.getElementById('stat-frames').textContent  = '0';
     }
 
-    const cpu = d.cpu_percent || 0;
-    const ram = d.ram_percent || 0;
-    document.getElementById('cpu-pct').textContent = cpu.toFixed(1) + '%';
-    document.getElementById('cpu-bar').style.width = cpu + '%';
-    document.getElementById('ram-pct').textContent = ram.toFixed(1) + '%';
-    document.getElementById('ram-bar').style.width = ram + '%';
-    document.getElementById('ram-detail').textContent = (d.ram_used_mb||0) + ' MB / ' + (d.ram_total_mb||0) + ' MB';
-  } catch(e) {
-    console.warn('Status poll error:', e);
-  }
+    document.getElementById('cpu-pct').textContent = (d.cpu_percent || 0).toFixed(1) + '%';
+    document.getElementById('cpu-bar').style.width = (d.cpu_percent || 0) + '%';
+    document.getElementById('ram-pct').textContent = (d.ram_percent || 0).toFixed(1) + '%';
+    document.getElementById('ram-bar').style.width = (d.ram_percent || 0) + '%';
+
+    if (d.seo) {
+      if (!document.getElementById('seo-title').value) document.getElementById('seo-title').value = d.seo.title || '';
+      if (!document.getElementById('seo-desc').value)  document.getElementById('seo-desc').value  = d.seo.description || '';
+      if (!document.getElementById('seo-tags').value)  document.getElementById('seo-tags').value  = d.seo.tags || '';
+      if (d.seo.thumbnail_url && document.getElementById('thumb-img').classList.contains('hidden')) {
+        document.getElementById('thumb-img').src = d.seo.thumbnail_url;
+        document.getElementById('thumb-img').classList.remove('hidden');
+        document.getElementById('thumb-placeholder').classList.add('hidden');
+      }
+    }
+  } catch(e) {}
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
-function setLoading(id, on) { document.getElementById(id).disabled = on; }
-
-let toastTimer;
 function showToast(msg, type='info') {
-  const t  = document.getElementById('toast');
+  const t = document.getElementById('toast');
   const ti = document.getElementById('toast-inner');
-  const color = {success:'text-emerald-400',error:'text-red-400',info:'text-sky-400'}[type];
-  const icon  = {success:'✅',error:'❌',info:'ℹ️'}[type];
-  ti.className = `glass-strong rounded-2xl px-5 py-4 text-sm font-semibold shadow-2xl ${color}`;
-  ti.textContent = icon + '  ' + msg;
+  ti.className = `glass-strong rounded-2xl px-5 py-3 text-xs font-bold ${type==='error'?'text-red-400':type==='success'?'text-emerald-400':'text-sky-400'}`;
+  ti.textContent = msg;
   t.classList.remove('hidden');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.add('hidden'), 4500);
+  setTimeout(() => t.classList.add('hidden'), 4000);
 }
 
-// ─── Init ──────────────────────────────────────────────────────────────────────
 pollStatus();
-setInterval(pollStatus, 3000);
+setInterval(pollStatus, 2000);
 </script>
 </body>
 </html>"""
@@ -1106,16 +1212,10 @@ HELP_TEXT = """
 🎥 *YouTube 24/7 Live Streamer Bot* — Pro Edition
 
 *Commands:*
-/start — Show this help
-/stream `<url>` `<key>` — Start with default settings (1080p, YouTube)
+/start — Help
+/stream `<url>` `<key>` — Start streaming
 /stop — Stop active stream
-/status — Show stats & metrics
-
-*Example:*
-```
-/stream https://cdn.example.com/video.mp4 xxxx-xxxx-xxxx-xxxx
-```
-Use the web dashboard for advanced options (platform, quality, FPS, cloud sources).
+/status — Show health & stats
 """
 
 
@@ -1144,22 +1244,22 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid      = stream_state.process.pid if stream_state.process else None
         platform = stream_state.platform
         quality  = stream_state.quality
-        fps      = stream_state.fps
-        auto_r   = stream_state.auto_reconnect
 
     stats  = get_system_stats()
     uptime = get_uptime()
+    l_stats = ffmpeg_live_stats
+
     status_line = (
         f"🟢 *Live* (PID: `{pid}`)\n"
         f"⏱ Uptime: `{uptime}`\n"
-        f"📺 Platform: `{platform}` | 🎬 Quality: `{quality}` | 🎞 FPS: `{fps}`\n"
-        f"🔄 Auto-Reconnect: `{'ON' if auto_r else 'OFF'}`"
+        f"📺 Platform: `{platform}` | 🎬 Quality: `{quality}`\n"
+        f"⚡ FPS: `{l_stats.get('fps', 0)}` | 📶 Bitrate: `{l_stats.get('bitrate', '0k')}` | 🚀 Speed: `{l_stats.get('speed', '1.0x')}`"
     ) if active else "🔴 *Offline*"
 
     await update.message.reply_text(
         f"📊 *Stream Status*\n\n{status_line}\n\n"
         f"⚡ CPU: `{stats['cpu_percent']:.1f}%` | "
-        f"🧠 RAM: `{stats['ram_percent']:.1f}%` ({stats['ram_used_mb']} MB / {stats['ram_total_mb']} MB)",
+        f"🧠 RAM: `{stats['ram_percent']:.1f}%`",
         parse_mode="Markdown",
     )
 
@@ -1184,9 +1284,6 @@ if __name__ == "__main__":
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if bot_token:
         threading.Thread(target=run_telegram_bot, args=(bot_token,), daemon=True, name="TelegramBot").start()
-        logger.info("Telegram bot thread started.")
-    else:
-        logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled.")
 
     logger.info("Starting Flask on 0.0.0.0:7860…")
     app.run(host="0.0.0.0", port=7860, debug=False, use_reloader=False, threaded=True)
