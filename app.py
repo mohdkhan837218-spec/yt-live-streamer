@@ -57,13 +57,17 @@ PLATFORM_RTMP = {
 
 # ─── Quality Presets ───────────────────────────────────────────────────────────
 QUALITY_PRESETS = {
+    "360p": {
+        "vb": "700k", "maxrate": "700k",
+        "bufsize": "1400k", "scale": "640:360",
+    },
     "480p": {
-        "vb": "1500k", "maxrate": "1500k",
-        "bufsize": "3000k", "scale": "854:480",
+        "vb": "1200k", "maxrate": "1200k",
+        "bufsize": "2400k", "scale": "854:480",
     },
     "720p": {
-        "vb": "2500k", "maxrate": "2500k",
-        "bufsize": "5000k", "scale": "1280:720",
+        "vb": "2200k", "maxrate": "2200k",
+        "bufsize": "4400k", "scale": "1280:720",
     },
     "1080p": {
         "vb": "4000k", "maxrate": "4000k",
@@ -215,7 +219,8 @@ def build_ffmpeg_command(
         "-i", video_url,
         "-vf", f"scale={q['scale']}:force_original_aspect_ratio=decrease,pad={q['scale']}:(ow-iw)/2:(oh-ih)/2",
         "-c:v", "libx264",
-        "-preset", "superfast",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
         "-b:v", q["vb"],
         "-maxrate", q["maxrate"],
         "-bufsize", q["bufsize"],
@@ -225,6 +230,9 @@ def build_ffmpeg_command(
         "-c:a", "aac",
         "-b:a", audio_bitrate,
         "-ar", "44100",
+        "-flvflags", "no_duration_filesize",
+        "-max_delay", "500000",
+        "-rtmp_buffer", "1000",
         "-f", "flv",
         rtmp,
     ]
@@ -923,10 +931,11 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <!-- Quality Preset -->
         <div class="mb-4">
-          <label class="block text-slate-400 text-xs font-semibold mb-2">Quality Preset (480p is recommended for free tier stability)</label>
-          <div class="grid grid-cols-2 md:grid-cols-5 gap-2">
-            <div class="q-card active" onclick="setQuality('480p')"     id="q-480p">     <div class="label">480p ⭐</div>  <div class="sub">1.5 Mbps</div></div>
-            <div class="q-card"        onclick="setQuality('720p')"     id="q-720p">     <div class="label">720p</div>    <div class="sub">2.5 Mbps</div></div>
+          <label class="block text-slate-400 text-xs font-semibold mb-2">Quality Preset (Choose 360p or 480p if experiencing network lag)</label>
+          <div class="grid grid-cols-2 md:grid-cols-6 gap-2">
+            <div class="q-card active" onclick="setQuality('360p')"     id="q-360p">     <div class="label">360p ⚡</div>  <div class="sub">700 Kbps · Zero Lag</div></div>
+            <div class="q-card"        onclick="setQuality('480p')"     id="q-480p">     <div class="label">480p ⭐</div>  <div class="sub">1.2 Mbps · Smooth</div></div>
+            <div class="q-card"        onclick="setQuality('720p')"     id="q-720p">     <div class="label">720p</div>    <div class="sub">2.2 Mbps</div></div>
             <div class="q-card"        onclick="setQuality('1080p')"   id="q-1080p">   <div class="label">1080p</div>   <div class="sub">4 Mbps</div></div>
             <div class="q-card"        onclick="setQuality('1080p_hq')" id="q-1080p_hq"> <div class="label">1080p HQ</div><div class="sub">6 Mbps</div></div>
             <div class="q-card"        onclick="setQuality('4k')"       id="q-4k">       <div class="label">4K Ultra</div><div class="sub">8 Mbps</div></div>
@@ -1025,7 +1034,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 let activeTab      = 'direct';
 let activePlatform = 'youtube';
-let activeQuality  = '480p';
+let activeQuality  = '360p';
 let resolvedURLs   = {};
 
 function switchTab(tab) {
@@ -1045,7 +1054,7 @@ function setPlatform(p) {
 }
 
 function setQuality(q) {
-  ['480p','720p','1080p','1080p_hq','4k'].forEach(x => {
+  ['360p','480p','720p','1080p','1080p_hq','4k'].forEach(x => {
     document.getElementById('q-' + x).classList.toggle('active', x === q);
   });
   activeQuality = q;
