@@ -123,18 +123,55 @@ ffmpeg_live_stats: dict = {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# URL Resolvers
+# Robust Universal Cloud URL Resolvers (Google Drive, Dropbox, YouTube, CDN)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def resolve_gdrive_url(url: str) -> tuple[str, str]:
-    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url)
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url) or re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
     if not match:
-        match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
-    if match:
-        file_id = match.group(1)
-        direct = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
-        return direct, ""
-    return "", "Google Drive: could not extract file ID from URL."
+        return "", "Google Drive: Invalid URL format. Could not extract file ID."
+
+    file_id = match.group(1)
+
+    # 1. Try yt-dlp for Google Drive file
+    try:
+        gdrive_view_url = f"https://drive.google.com/file/d/{file_id}/view"
+        res = subprocess.run(
+            ["yt-dlp", "-g", "--no-warnings", gdrive_view_url],
+            capture_output=True,
+            text=True,
+            timeout=25,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            direct = res.stdout.strip().splitlines()[0]
+            logger.info("Google Drive resolved via yt-dlp: %s", direct[:60])
+            return direct, ""
+    except Exception as exc:
+        logger.debug("gdrive yt-dlp attempt failed: %s", exc)
+
+    # 2. Try requests session to follow confirmation tokens
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        })
+        base_url = "https://docs.google.com/uc?export=download"
+        r = session.get(base_url, params={"id": file_id}, stream=True, timeout=15)
+
+        for key, value in r.cookies.items():
+            if key.startswith("download_warning"):
+                r = session.get(base_url, params={"id": file_id, "confirm": value}, stream=True, timeout=15)
+                logger.info("Google Drive resolved via confirm cookie: %s", r.url[:60])
+                return r.url, ""
+
+        if "drive.google.com" not in r.url and "googleusercontent.com" in r.url:
+            return r.url, ""
+
+    except Exception as exc:
+        logger.debug("gdrive requests attempt failed: %s", exc)
+
+    # 3. Direct export fallback
+    return f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t", ""
 
 
 def resolve_dropbox_url(url: str) -> tuple[str, str]:
@@ -152,32 +189,56 @@ def resolve_youtube_url(url: str) -> tuple[str, str]:
             [
                 "yt-dlp",
                 "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "--no-warnings",
                 "--get-url",
                 url,
             ],
             capture_output=True,
             text=True,
-            timeout=45,
+            timeout=35,
         )
         if result.returncode == 0:
             urls = result.stdout.strip().splitlines()
-            return urls[0], ""
+            if urls:
+                return urls[0], ""
         return "", f"yt-dlp error: {result.stderr.strip()[:300]}"
     except FileNotFoundError:
-        return "", "yt-dlp is not installed in this container."
+        return "", "yt-dlp is not installed."
     except subprocess.TimeoutExpired:
-        return "", "yt-dlp timed out while fetching YouTube URL."
+        return "", "yt-dlp timed out fetching media stream."
     except Exception as exc:
         return "", str(exc)
 
 
 def resolve_video_url(raw_url: str, source_type: str) -> tuple[str, str]:
-    if source_type == "gdrive":
+    raw_url = raw_url.strip()
+    if not raw_url:
+        return "", "Empty URL provided."
+
+    # Auto-detect source if needed
+    if "drive.google.com" in raw_url or "docs.google.com" in raw_url or source_type == "gdrive":
         return resolve_gdrive_url(raw_url)
-    if source_type == "dropbox":
+    if "dropbox.com" in raw_url or source_type == "dropbox":
         return resolve_dropbox_url(raw_url)
-    if source_type == "youtube":
+    if "youtube.com" in raw_url or "youtu.be" in raw_url or source_type == "youtube":
         return resolve_youtube_url(raw_url)
+
+    # Universal yt-dlp check for other cloud video platforms (Vimeo, Dailymotion, Facebook, Twitch clips, etc.)
+    if source_type in {"direct", "cloud", ""}:
+        try:
+            res = subprocess.run(
+                ["yt-dlp", "-g", "--no-warnings", raw_url],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                extracted = res.stdout.strip().splitlines()[0]
+                logger.info("Universal yt-dlp resolved URL: %s", extracted[:60])
+                return extracted, ""
+        except Exception:
+            pass
+
     return raw_url, ""
 
 
@@ -212,6 +273,8 @@ def build_ffmpeg_command(
 
     return [
         "ffmpeg",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n",
         "-re",
         "-stream_loop", "-1",
         "-i", video_url,
