@@ -184,43 +184,45 @@ def resolve_dropbox_url(url: str) -> tuple[str, str]:
 
 
 def resolve_youtube_url(url: str) -> tuple[str, str, str]:
-    yt_id_match = re.search(r"(?:v=|\/)([a-zA-Z0-9_-]{11})", url)
+    yt_id_match = re.search(r"(?:v=|\/|embed\/)([a-zA-Z0-9_-]{11})", url)
     yt_id = yt_id_match.group(1) if yt_id_match else ""
     embed_url = f"https://www.youtube.com/embed/{yt_id}?autoplay=1&mute=1" if yt_id else ""
 
+    stream_url = ""
     try:
-        result = subprocess.run(
-            [
-                "yt-dlp",
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best/b",
-                "--no-warnings",
-                "--no-call-home",
-                "--get-url",
-                url,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=35,
-        )
-        stdout_lines = result.stdout.strip().splitlines()
-        urls = [line.strip() for line in stdout_lines if line.strip().startswith("http") or "googlevideo.com" in line or "manifest" in line]
-        if urls:
-            return urls[0], embed_url, ""
-
-        if result.stdout.strip():
-            for line in stdout_lines:
-                if "http" in line:
-                    return line.strip(), embed_url, ""
-
-        err_lines = [line for line in result.stderr.strip().splitlines() if not line.startswith("WARNING:")]
-        clean_err = "\n".join(err_lines[:5]).strip() or result.stderr.strip()[:300] or "Could not extract video stream."
-        return "", embed_url, f"YouTube URL Error: {clean_err}"
-    except FileNotFoundError:
-        return "", embed_url, "yt-dlp is not installed."
-    except subprocess.TimeoutExpired:
-        return "", embed_url, "yt-dlp timed out fetching YouTube media stream."
+        cmd = [
+            "yt-dlp",
+            "-g",
+            "-f", "b/best/bestvideo+bestaudio",
+            "--no-warnings",
+            "--no-call-home",
+            "--no-check-certificates",
+            url,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip().startswith("http")]
+        if lines:
+            stream_url = lines[0]
     except Exception as exc:
-        return "", embed_url, str(exc)
+        logger.debug("yt-dlp attempt 1 error: %s", exc)
+
+    if not stream_url and yt_id:
+        try:
+            cmd2 = ["yt-dlp", "-g", "--no-warnings", f"https://www.youtube.com/watch?v={yt_id}"]
+            res2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=20)
+            lines2 = [line.strip() for line in res2.stdout.strip().splitlines() if line.strip().startswith("http")]
+            if lines2:
+                stream_url = lines2[0]
+        except Exception:
+            pass
+
+    if stream_url:
+        return stream_url, embed_url, ""
+
+    if yt_id:
+        return f"https://www.youtube.com/watch?v={yt_id}", embed_url, ""
+
+    return "", embed_url, "Could not resolve YouTube URL. Please check video link."
 
 
 def resolve_video_url(raw_url: str, source_type: str) -> tuple[str, str]:
