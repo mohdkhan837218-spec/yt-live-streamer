@@ -1,11 +1,12 @@
 """
-YouTube 24/7 Live Streamer — app.py (Ultimate Pro Edition with Live Upload Progress)
-=====================================================================================
-Flask + Telegram Bot + FFmpeg + Live Upload Progress & Media Verification:
-  - Multiple video sources (URL / PC Upload / Google Drive / Dropbox / YouTube via yt-dlp)
-  - Real-Time PC Upload Progress Bar (Percentage %, MBs transferred, upload speed)
-  - Cloud Link Probe & Live Verification Stepper
+YouTube 24/7 Live Streamer — app.py (Ultimate Pro Edition with Full CORS & Zero-Lag Stream)
+========================================================================================
+Flask + Telegram Bot + FFmpeg + Live Upload Progress + Live Video Preview + YouTube SEO Engine:
+  - Full CORS Support (Allow all origins for Hugging Face Static & Cloud embeds)
+  - Multiple video sources (Direct URL / PC Upload / Google Drive / Dropbox / YouTube via yt-dlp)
+  - Real-Time PC Upload Progress Bar & Video Preview Window
   - Real-Time FFmpeg Health & Speed Stats Monitor (FPS, Bitrate, Speed, Health Badge)
+  - Ultra-Fast Zero Lag Presets (360p 500Kbps / 480p 900Kbps)
   - YouTube Live SEO & Metadata Suite (Title, Description, Tags Generator, Thumbnail Upload)
 """
 
@@ -24,7 +25,7 @@ from typing import Optional
 
 import psutil
 import requests
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, make_response
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -39,6 +40,14 @@ logger = logging.getLogger("yt-streamer")
 
 # ─── Flask App ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+
+# ─── CORS Support ──────────────────────────────────────────────────────────────
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
 
 # ─── Upload Directories ────────────────────────────────────────────────────────
 UPLOAD_DIR = Path("/tmp/yt_streamer_uploads")
@@ -55,32 +64,14 @@ PLATFORM_RTMP = {
     "custom":   "{}",
 }
 
-# ─── Quality Presets ───────────────────────────────────────────────────────────
+# ─── Quality Presets (Tuned for Zero Lag) ──────────────────────────────────────
 QUALITY_PRESETS = {
-    "360p": {
-        "vb": "700k", "maxrate": "700k",
-        "bufsize": "1400k", "scale": "640:360",
-    },
-    "480p": {
-        "vb": "1200k", "maxrate": "1200k",
-        "bufsize": "2400k", "scale": "854:480",
-    },
-    "720p": {
-        "vb": "2200k", "maxrate": "2200k",
-        "bufsize": "4400k", "scale": "1280:720",
-    },
-    "1080p": {
-        "vb": "4000k", "maxrate": "4000k",
-        "bufsize": "8000k", "scale": "1920:1080",
-    },
-    "1080p_hq": {
-        "vb": "6000k", "maxrate": "6000k",
-        "bufsize": "12000k", "scale": "1920:1080",
-    },
-    "4k": {
-        "vb": "8000k", "maxrate": "8000k",
-        "bufsize": "16000k", "scale": "3840:2160",
-    },
+    "360p":     {"vb": "500k",  "maxrate": "500k",  "bufsize": "1000k", "scale": "640:360"},
+    "480p":     {"vb": "900k",  "maxrate": "900k",  "bufsize": "1800k", "scale": "854:480"},
+    "720p":     {"vb": "1800k", "maxrate": "1800k", "bufsize": "3600k", "scale": "1280:720"},
+    "1080p":    {"vb": "3500k", "maxrate": "3500k", "bufsize": "7000k", "scale": "1920:1080"},
+    "1080p_hq": {"vb": "5000k", "maxrate": "5000k", "bufsize": "10000k", "scale": "1920:1080"},
+    "4k":       {"vb": "7500k", "maxrate": "7500k", "bufsize": "15000k", "scale": "3840:2160"},
 }
 
 
@@ -96,21 +87,19 @@ class StreamState:
     video_url: str = ""
     stream_key: str = ""
     platform: str = "youtube"
-    quality: str = "480p"
+    quality: str = "360p"
     fps: int = 30
     audio_bitrate: str = "128k"
-    auto_reconnect: bool = False
+    auto_reconnect: bool = True
     started_at: Optional[datetime] = None
     is_active: bool = False
     uploaded_file: Optional[Path] = None
 
-    # Media Source Tracking
     attached_source_name: str = ""
     attached_source_type: str = ""
     attached_size_mb: float = 0.0
-    attached_status: str = "none"  # none | verified | uploading | failed
+    attached_status: str = "none"
 
-    # SEO & Metadata
     title: str = "24/7 Non-Stop Live Stream 🔴"
     description: str = "Welcome to our 24/7 non-stop continuous live stream! Enjoy watching."
     tags: str = "live, 24/7, streaming, youtube live, stream"
@@ -120,7 +109,6 @@ class StreamState:
 
 stream_state = StreamState()
 
-# Live stats from FFmpeg stderr
 ffmpeg_live_stats: dict = {
     "frame": 0,
     "fps": 0.0,
@@ -204,11 +192,11 @@ def build_ffmpeg_command(
     video_url: str,
     stream_key: str,
     platform: str = "youtube",
-    quality: str = "480p",
+    quality: str = "360p",
     fps: int = 30,
     audio_bitrate: str = "128k",
 ) -> list[str]:
-    q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["480p"])
+    q = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["360p"])
     rtmp = build_rtmp_url(platform, stream_key)
     gop = fps * 2
 
@@ -221,6 +209,9 @@ def build_ffmpeg_command(
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-tune", "zerolatency",
+        "-subq", "1",
+        "-me_method", "dia",
+        "-sc_threshold", "0",
         "-b:v", q["vb"],
         "-maxrate", q["maxrate"],
         "-bufsize", q["bufsize"],
@@ -363,10 +354,10 @@ def start_stream(
     video_url: str,
     stream_key: str,
     platform: str = "youtube",
-    quality: str = "480p",
+    quality: str = "360p",
     fps: int = 30,
     audio_bitrate: str = "128k",
-    auto_reconnect: bool = False,
+    auto_reconnect: bool = True,
 ) -> tuple[bool, str]:
     with _state_lock:
         if stream_state.is_active and stream_state.process:
@@ -449,17 +440,20 @@ def index():
     return render_template_string(DASHBOARD_HTML)
 
 
-@app.route("/start", methods=["POST"])
+@app.route("/start", methods=["POST", "OPTIONS"])
 def route_start():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     data          = request.get_json(silent=True) or request.form
     raw_url       = (data.get("url")          or "").strip()
     stream_key    = (data.get("key")          or "").strip()
     source_type   = (data.get("source_type")  or "direct").strip()
     platform      = (data.get("platform")     or "youtube").strip()
-    quality       = (data.get("quality")      or "480p").strip()
+    quality       = (data.get("quality")      or "360p").strip()
     fps           = int(data.get("fps", 30))
     audio_bitrate = (data.get("audio_bitrate") or "128k").strip()
-    auto_reconnect = str(data.get("auto_reconnect", "false")).lower() == "true"
+    auto_reconnect = str(data.get("auto_reconnect", "true")).lower() == "true"
 
     if not raw_url:
         return jsonify({"success": False, "message": "Video URL/path is required."}), 400
@@ -468,7 +462,7 @@ def route_start():
     if platform not in PLATFORM_RTMP:
         return jsonify({"success": False, "message": f"Unknown platform: {platform}"}), 400
     if quality not in QUALITY_PRESETS:
-        quality = "480p"
+        quality = "360p"
 
     if source_type != "upload":
         video_url, err = resolve_video_url(raw_url, source_type)
@@ -483,14 +477,19 @@ def route_start():
     return jsonify({"success": success, "message": message}), 200 if success else 409
 
 
-@app.route("/stop", methods=["POST"])
+@app.route("/stop", methods=["POST", "OPTIONS"])
 def route_stop():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
     success, message = stop_stream()
     return jsonify({"success": success, "message": message})
 
 
-@app.route("/api/status")
+@app.route("/api/status", methods=["GET", "OPTIONS"])
 def route_status():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     with _state_lock:
         active   = stream_state.is_active
         pid      = stream_state.process.pid if stream_state.process else None
@@ -540,8 +539,11 @@ def route_status():
     })
 
 
-@app.route("/upload", methods=["POST"])
+@app.route("/upload", methods=["POST", "OPTIONS"])
 def route_upload():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     if "file" not in request.files:
         return jsonify({"success": False, "message": "No file part."}), 400
 
@@ -589,8 +591,11 @@ def route_get_uploaded_video(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
 
-@app.route("/upload-thumbnail", methods=["POST"])
+@app.route("/upload-thumbnail", methods=["POST", "OPTIONS"])
 def route_upload_thumbnail():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     if "file" not in request.files:
         return jsonify({"success": False, "message": "No image file provided."}), 400
 
@@ -622,8 +627,11 @@ def route_get_thumbnail(filename):
     return send_from_directory(THUMB_DIR, filename)
 
 
-@app.route("/save-seo", methods=["POST"])
+@app.route("/save-seo", methods=["POST", "OPTIONS"])
 def route_save_seo():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     data = request.get_json(silent=True) or request.form
     title = (data.get("title") or "").strip()
     desc  = (data.get("description") or "").strip()
@@ -643,8 +651,11 @@ def route_save_seo():
     })
 
 
-@app.route("/resolve-url", methods=["POST"])
+@app.route("/resolve-url", methods=["POST", "OPTIONS"])
 def route_resolve_url():
+    if request.method == "OPTIONS":
+        return make_response("", 200)
+
     data        = request.get_json(silent=True) or {}
     raw_url     = (data.get("url")         or "").strip()
     source_type = (data.get("source_type") or "").strip()
@@ -676,7 +687,7 @@ def route_resolve_url():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Dashboard HTML
+# Dashboard HTML — Ultimate Dark UI with Live Upload Tracker & Player
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -684,7 +695,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>YouTube 24/7 Live Streamer — Pro Dashboard & Live Upload Tracker</title>
+  <title>YouTube 24/7 Live Streamer — Pro Dashboard</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet"/>
@@ -731,6 +742,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .btn-start:hover:not(:disabled){background:linear-gradient(135deg,#10b981,#059669);transform:translateY(-2px);box-shadow:0 12px 30px rgba(5,150,105,.4)}
     .btn-stop{background:linear-gradient(135deg,#dc2626,#b91c1c);border:none;color:#fff;padding:14px 24px;border-radius:14px;font-weight:700;font-size:.9rem;cursor:pointer;transition:all .2s;display:flex;align-items:center;justify-content:center;gap:8px;width:100%}
     .btn-stop:hover:not(:disabled){background:linear-gradient(135deg,#ef4444,#dc2626);transform:translateY(-2px);box-shadow:0 12px 30px rgba(220,38,38,.4)}
+    button:disabled{opacity:.45;cursor:not-allowed;transform:none!important}
 
     .pbar{height:8px;border-radius:4px;background:rgba(255,255,255,0.08);overflow:hidden}
     .pbar-fill{height:100%;border-radius:4px;transition:width .3s ease}
@@ -913,7 +925,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- ATTACHED VIDEO MEDIA BADGE (Live status of current video) -->
+        <!-- ATTACHED VIDEO MEDIA BADGE -->
         <div id="attached-media-card" class="mt-4 glass rounded-xl p-3 border border-sky-500/30 flex items-center justify-between">
           <div class="flex items-center gap-3">
             <span class="text-2xl">📌</span>
@@ -957,14 +969,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <!-- Quality Preset -->
         <div class="mb-4">
-          <label class="block text-slate-400 text-xs font-semibold mb-2">Quality Preset (Choose 360p or 480p if experiencing network lag)</label>
+          <label class="block text-slate-400 text-xs font-semibold mb-2">Quality Preset (Choose 360p or 480p for Zero Lag)</label>
           <div class="grid grid-cols-2 md:grid-cols-6 gap-2">
-            <div class="q-card active" onclick="setQuality('360p')"     id="q-360p">     <div class="label">360p ⚡</div>  <div class="sub">700 Kbps · Zero Lag</div></div>
-            <div class="q-card"        onclick="setQuality('480p')"     id="q-480p">     <div class="label">480p ⭐</div>  <div class="sub">1.2 Mbps · Smooth</div></div>
-            <div class="q-card"        onclick="setQuality('720p')"     id="q-720p">     <div class="label">720p</div>    <div class="sub">2.2 Mbps</div></div>
-            <div class="q-card"        onclick="setQuality('1080p')"   id="q-1080p">   <div class="label">1080p</div>   <div class="sub">4 Mbps</div></div>
-            <div class="q-card"        onclick="setQuality('1080p_hq')" id="q-1080p_hq"> <div class="label">1080p HQ</div><div class="sub">6 Mbps</div></div>
-            <div class="q-card"        onclick="setQuality('4k')"       id="q-4k">       <div class="label">4K Ultra</div><div class="sub">8 Mbps</div></div>
+            <div class="q-card active" onclick="setQuality('360p')"     id="q-360p">     <div class="label">360p ⚡</div>  <div class="sub">500 Kbps · Zero Lag</div></div>
+            <div class="q-card"        onclick="setQuality('480p')"     id="q-480p">     <div class="label">480p ⭐</div>  <div class="sub">900 Kbps · Smooth</div></div>
+            <div class="q-card"        onclick="setQuality('720p')"     id="q-720p">     <div class="label">720p</div>    <div class="sub">1.8 Mbps</div></div>
+            <div class="q-card"        onclick="setQuality('1080p')"   id="q-1080p">   <div class="label">1080p</div>   <div class="sub">3.5 Mbps</div></div>
+            <div class="q-card"        onclick="setQuality('1080p_hq')" id="q-1080p_hq"> <div class="label">1080p HQ</div><div class="sub">5 Mbps</div></div>
+            <div class="q-card"        onclick="setQuality('4k')"       id="q-4k">       <div class="label">4K Ultra</div><div class="sub">7.5 Mbps</div></div>
           </div>
         </div>
 
@@ -1107,6 +1119,19 @@ async function resolveURL(sourceType) {
     const data = await res.json();
     if (data.success) {
       resolvedURLs[sourceType] = data.resolved_url;
+
+      // Load preview player for direct URL
+      if (sourceType === 'direct' || sourceType === 'gdrive' || sourceType === 'dropbox') {
+        const player = document.getElementById('video-preview-player');
+        const placeholder = document.getElementById('video-preview-placeholder');
+        const badge = document.getElementById('preview-badge');
+        player.src = data.resolved_url;
+        player.classList.remove('hidden');
+        placeholder.classList.add('hidden');
+        badge.className = 'px-2.5 py-1 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+        badge.textContent = '🟢 PREVIEW READY (' + data.source_label + ')';
+      }
+
       showToast('✅ Cloud video verified & attached!', 'success');
       pollStatus();
     } else {
@@ -1117,7 +1142,6 @@ async function resolveURL(sourceType) {
   }
 }
 
-// Real-Time PC File Upload with Live Progress Bar & Completion Guard
 function handleFileSelect(input) {
   if (!input.files[0]) return;
   const file = input.files[0];
@@ -1139,7 +1163,6 @@ function handleFileSelect(input) {
   barEl.className    = 'pbar-fill bg-amber-400';
   barEl.style.width  = '0%';
 
-  // Lock Start Button during upload
   startBtn.disabled  = true;
   startBtn.textContent = '⏳ Uploading Video... Please Wait';
 
@@ -1171,18 +1194,15 @@ function handleFileSelect(input) {
         resolvedURLs['upload'] = data.file_path;
         document.getElementById('url-upload').value = data.file_path;
 
-        // Completion status UI updates
         pctEl.textContent  = '100% COMPLETE 🎉';
         pctEl.className    = 'text-emerald-400 text-sm font-black';
         barEl.className    = 'pbar-fill bg-emerald-400';
         barEl.style.width  = '100%';
         banner.classList.remove('hidden');
 
-        // Unlock Start Stream Button
         startBtn.disabled  = false;
         startBtn.textContent = '▶️ Start 24/7 Stream';
 
-        // Load Live Video Preview Player
         if (data.preview_url) {
           const player = document.getElementById('video-preview-player');
           const placeholder = document.getElementById('video-preview-placeholder');
@@ -1370,7 +1390,6 @@ async function pollStatus() {
     document.getElementById('ram-pct').textContent = (d.ram_percent || 0).toFixed(1) + '%';
     document.getElementById('ram-bar').style.width = (d.ram_percent || 0) + '%';
 
-    // Update Attached Source Widget
     if (d.attached_source && d.attached_source.name) {
       document.getElementById('attached-name').textContent = d.attached_source.name;
       document.getElementById('attached-type').textContent = d.attached_source.type + (d.attached_source.size_mb ? ` (${d.attached_source.size_mb} MB)` : '');
